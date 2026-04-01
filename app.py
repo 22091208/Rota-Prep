@@ -2,10 +2,11 @@
 import calendar
 import io
 import json
+import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -13,10 +14,13 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 APP_DIR = Path(__file__).resolve().parent
+DB_FILE = APP_DIR / "rota.db"
 DATA_FILE = APP_DIR / "rota_saved_inputs.json"
 ROTA_FILE = APP_DIR / "rota_saved_output.json"
 ROTA_EXCEL_FILE = APP_DIR / "rota_saved_output.xlsx"
 ROTA_CSV_FILE = APP_DIR / "rota_saved_matrix.csv"
+STATE_KEY_INPUTS = "saved_inputs"
+STATE_KEY_ROTA = "saved_rota"
 
 SHIFT_MORNING = "Morning"
 SHIFT_AFTERNOON = "Afternoon"
@@ -57,6 +61,74 @@ MIN_NIGHT = 2
 MAX_CONTINUOUS_NIGHT = 5
 MANDATORY_OFF_AFTER_NIGHT = 2
 MAX_CONTINUOUS_WORKING_DAYS = 6
+
+
+def init_database():
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_state (
+                state_key TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def json_default(value: Any) -> str:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def save_state(state_key: str, payload: dict):
+    init_database()
+    serialized = json.dumps(payload, indent=2, default=json_default)
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            """
+            INSERT INTO app_state(state_key, payload, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(state_key) DO UPDATE SET
+                payload = excluded.payload,
+                updated_at = excluded.updated_at
+            """,
+            (state_key, serialized, datetime.utcnow().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+
+
+def load_state(state_key: str) -> Optional[dict]:
+    init_database()
+    with sqlite3.connect(DB_FILE) as conn:
+        row = conn.execute(
+            "SELECT payload FROM app_state WHERE state_key = ?",
+            (state_key,),
+        ).fetchone()
+    if row is None:
+        return None
+    return json.loads(row[0])
+
+
+def delete_state(state_key: str):
+    init_database()
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("DELETE FROM app_state WHERE state_key = ?", (state_key,))
+        conn.commit()
+
+
+def migrate_legacy_json_if_needed(state_key: str, legacy_file: Path):
+    if load_state(state_key) is not None or not legacy_file.exists():
+        return
+    try:
+        payload = json.loads(legacy_file.read_text())
+        save_state(state_key, payload)
+    except Exception:
+        pass
 
 
 @dataclass
@@ -142,11 +214,12 @@ def sample_sync_groups_df() -> pd.DataFrame:
 
 
 def load_inputs():
-    if not DATA_FILE.exists():
+    migrate_legacy_json_if_needed(STATE_KEY_INPUTS, DATA_FILE)
+    data = load_state(STATE_KEY_INPUTS)
+    if data is None:
         return sample_team_df(), sample_leaves_df(), sample_bank_holidays_df(), sample_sync_groups_df()
 
     try:
-        data = json.loads(DATA_FILE.read_text())
         team_df = pd.DataFrame(data.get("team", []))
         if team_df.empty:
             team_df = sample_team_df()
@@ -192,7 +265,7 @@ def save_inputs(team_df: pd.DataFrame, leaves_df: pd.DataFrame, bank_df: pd.Data
         "bank_holidays": serialize_dates_for_json(bank_df.to_dict(orient="records"), ["bank_holiday_date"]),
         "sync_groups": sync_df.fillna("").to_dict(orient="records"),
     }
-    DATA_FILE.write_text(json.dumps(payload, indent=2))
+    save_state(STATE_KEY_INPUTS, payload)
 
 
 def save_generated_rota(matrix_df: pd.DataFrame, full_df: pd.DataFrame, daywise_df: pd.DataFrame,
@@ -211,16 +284,17 @@ def save_generated_rota(matrix_df: pd.DataFrame, full_df: pd.DataFrame, daywise_
         "summary_df": summary_df.to_dict(orient="records"),
         "warnings_df": warnings_df.to_dict(orient="records"),
     }
-    ROTA_FILE.write_text(json.dumps(payload, indent=2))
+    save_state(STATE_KEY_ROTA, payload)
     ROTA_CSV_FILE.write_text(matrix_df.to_csv(index=False))
     ROTA_EXCEL_FILE.write_bytes(excel_bytes)
 
 
 def load_saved_rota():
-    if not ROTA_FILE.exists():
+    migrate_legacy_json_if_needed(STATE_KEY_ROTA, ROTA_FILE)
+    payload = load_state(STATE_KEY_ROTA)
+    if payload is None:
         return None
     try:
-        payload = json.loads(ROTA_FILE.read_text())
         return {
             "metadata": payload.get("metadata", {}),
             "matrix_df": pd.DataFrame(payload.get("matrix_df", [])),
@@ -961,8 +1035,8 @@ with st.sidebar:
     st.markdown("**Mandatory daily staffing:** 2 Morning, 2 Night, 2 Afternoon")
     st.markdown("**Rules:** max 5 continuous Night shifts, 2 compulsory WO after Night block, max 6 continuous working days")
     st.divider()
-    st.caption(f"Saved inputs file: {DATA_FILE.name}")
-    st.caption(f"Saved rota file: {ROTA_FILE.name}")
+    st.caption(f"Database storage: {DB_FILE.name}")
+    st.caption("Legacy JSON saves are imported automatically if they already exist.")
 
 rota_bundle = None
 
@@ -987,14 +1061,15 @@ if can_manage:
         if st.button("Save Team Details", use_container_width=True):
             try:
                 save_inputs(team_df, leaves_default_df, bank_holidays_default_df, sync_groups_default_df)
-                st.success("Team details saved locally.")
+                st.success("Team details saved to the database.")
             except Exception as e:
                 st.error(f"Could not save team details: {e}")
     with row2:
         if st.button("Reset Saved Data", use_container_width=True):
+            delete_state(STATE_KEY_INPUTS)
             if DATA_FILE.exists():
                 DATA_FILE.unlink()
-            st.success("Saved data cleared. Refresh the app.")
+            st.success("Saved input data cleared from the database. Refresh the app.")
 
     st.subheader("2) Leaves")
     st.caption("Enter one row per leave range.")
@@ -1057,7 +1132,7 @@ if can_manage:
     if save_all:
         try:
             save_inputs(team_df, leaves_df, specific_bh_df, sync_groups_df)
-            st.success("Inputs saved locally.")
+            st.success("Inputs saved to the database.")
         except Exception as e:
             st.error(f"Could not save inputs: {e}")
 
@@ -1104,7 +1179,7 @@ if can_manage:
                 "excel_bytes": excel_bytes,
             }
             st.session_state["rota_bundle"] = rota_bundle
-            st.success("ROTA generated and saved locally.")
+            st.success("ROTA generated and saved to the database.")
         except Exception as e:
             st.error(str(e))
 
@@ -1129,7 +1204,7 @@ if rota_bundle is None and saved_rota is not None:
             "bank_holidays": saved_rota["bank_holidays"],
             "excel_bytes": excel_bytes,
         }
-        st.info(f"Loaded saved rota from {saved_rota['metadata'].get('saved_at', 'previous run')} UTC.")
+        st.info(f"Loaded saved rota from the database. Saved at {saved_rota['metadata'].get('saved_at', 'previous run')} UTC.")
     except Exception as e:
         st.warning(f"Could not load saved rota: {e}")
 
