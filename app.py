@@ -659,6 +659,41 @@ def preferred_night_block_length(remaining_days: int) -> int:
     return base + (1 if extra else 0)
 
 
+def build_night_block_lengths(total_days: int, block_count: int) -> List[int]:
+    if total_days <= 0 or block_count <= 0 or block_count > total_days:
+        return []
+    if block_count * MAX_CONTINUOUS_NIGHT < total_days:
+        return []
+    base, extra = divmod(total_days, block_count)
+    lengths = [base + (1 if idx < extra else 0) for idx in range(block_count)]
+    if any(length <= 0 or length > MAX_CONTINUOUS_NIGHT for length in lengths):
+        return []
+    return lengths
+
+
+def plan_night_lane_block_lengths(total_days: int, eligible_member_count: int) -> Tuple[List[List[int]], bool]:
+    if total_days <= 0:
+        return [[] for _ in range(MIN_NIGHT)], False
+
+    min_blocks_per_lane = (total_days + MAX_CONTINUOUS_NIGHT - 1) // MAX_CONTINUOUS_NIGHT
+    lane_block_counts = [min_blocks_per_lane for _ in range(MIN_NIGHT)]
+    base_total_blocks = sum(lane_block_counts)
+    total_night_slots = total_days * MIN_NIGHT
+    target_total_blocks = min(max(eligible_member_count, base_total_blocks), total_night_slots)
+    everyone_can_get_night_block = eligible_member_count <= total_night_slots
+
+    extra_blocks = max(0, target_total_blocks - base_total_blocks)
+    lane_index = 0
+    while extra_blocks > 0:
+        if lane_block_counts[lane_index] < total_days:
+            lane_block_counts[lane_index] += 1
+            extra_blocks -= 1
+        lane_index = (lane_index + 1) % MIN_NIGHT
+
+    lane_lengths = [build_night_block_lengths(total_days, count) for count in lane_block_counts]
+    return lane_lengths, everyone_can_get_night_block
+
+
 def pick_night_block_owner(
     candidates: List[str],
     block_dates: List[date],
@@ -705,6 +740,7 @@ def plan_night_shift_blocks(
     leaves: Dict[str, Set[date]],
     dates: List[date],
     sync_groups: Dict[str, List[str]],
+    bank_holidays: Set[date],
 ) -> Tuple[Dict[date, List[str]], Dict[str, Dict[date, str]], List[dict]]:
     member_names = [m.name for m in members]
     member_map = {m.name: m for m in members}
@@ -732,24 +768,32 @@ def plan_night_shift_blocks(
     fallback_candidates = [name for name in member_names if not member_map[name].afternoon_only]
 
     for month, month_dates in sorted(month_dates_map.items()):
-        for _ in range(MIN_NIGHT):
-            month_pos = 0
-            while month_pos < len(month_dates):
-                remaining_days = len(month_dates) - month_pos
-                preferred_len = preferred_night_block_length(remaining_days)
-                candidate_lengths = [preferred_len]
-                if preferred_len > 2:
-                    candidate_lengths.extend(range(preferred_len - 1, 1, -1))
-                elif preferred_len == 2:
-                    candidate_lengths = [2]
-                if remaining_days == 1:
-                    candidate_lengths = [1]
+        eligible_for_night = [
+            name for name in member_names
+            if not member_map[name].afternoon_only
+        ]
+        lane_block_lengths, everyone_can_get_night_block = plan_night_lane_block_lengths(len(month_dates), len(eligible_for_night))
 
+        if not everyone_can_get_night_block and eligible_for_night:
+            warnings.append({
+                "date": month_dates[0].isoformat(),
+                "warning": (
+                    "Night demand exceeds the standard 2-resource Night capacity for this month. "
+                    "The planner may use a 3rd Night resource on non-restricted days so more eligible members still receive a Night block."
+                ),
+            })
+
+        for lane_lengths in lane_block_lengths:
+            month_pos = 0
+            for planned_len in lane_lengths:
                 chosen_name = None
                 chosen_len = 0
                 start_dt = month_dates[month_pos]
                 global_start_index = date_index[start_dt]
                 previous_dt = dates[global_start_index - 1] if global_start_index > 0 else None
+                candidate_lengths = [planned_len]
+                if planned_len > 1:
+                    candidate_lengths.extend(range(planned_len - 1, 0, -1))
 
                 for block_len in candidate_lengths:
                     block_dates = month_dates[month_pos: month_pos + block_len]
@@ -782,7 +826,7 @@ def plan_night_shift_blocks(
                         "date": start_dt.isoformat(),
                         "warning": "Night planner could not pre-assign a continuous block. Fallback day-level night allocation will be used.",
                     })
-                    month_pos += 1
+                    month_pos += max(1, planned_len)
                     continue
 
                 if chosen_len == 1:
@@ -809,6 +853,62 @@ def plan_night_shift_blocks(
                 month_block_count[chosen_name][month] = month_block_count[chosen_name].get(month, 0) + 1
                 night_day_count[chosen_name] += chosen_len
                 month_pos += chosen_len
+
+        missing_night_members = [
+            name for name in eligible_for_night
+            if month_block_count[name].get(month, 0) == 0
+        ]
+        if missing_night_members:
+            extra_night_dates = sorted(
+                [dt for dt in month_dates if not is_restricted_staffing_day(dt, bank_holidays)],
+                reverse=True,
+            )
+            for missing_name in missing_night_members:
+                assigned_extra_night = False
+                for extra_dt in extra_night_dates:
+                    if len(planned_night_primaries[extra_dt]) >= 3:
+                        continue
+
+                    global_start_index = date_index[extra_dt]
+                    previous_dt = dates[global_start_index - 1] if global_start_index > 0 else None
+                    off_dates = dates[
+                        global_start_index + 1: min(global_start_index + 1 + MANDATORY_OFF_AFTER_NIGHT, len(dates))
+                    ]
+                    chosen_name = pick_night_block_owner(
+                        candidates=[missing_name],
+                        block_dates=[extra_dt],
+                        off_dates=off_dates,
+                        previous_dt=previous_dt,
+                        reservations=reservations,
+                        member_map=member_map,
+                        sync_groups=sync_groups,
+                        month=month,
+                        month_block_count=month_block_count,
+                        night_day_count=night_day_count,
+                    )
+                    if not chosen_name:
+                        continue
+
+                    reservations[chosen_name][extra_dt] = SHIFT_NIGHT
+                    planned_night_primaries[extra_dt].append(chosen_name)
+                    for off_dt in off_dates:
+                        if reservations[chosen_name].get(off_dt) == SHIFT_UNASSIGNED:
+                            reservations[chosen_name][off_dt] = SHIFT_WEEKOFF
+
+                    month_block_count[chosen_name][month] = month_block_count[chosen_name].get(month, 0) + 1
+                    night_day_count[chosen_name] += 1
+                    warnings.append({
+                        "date": extra_dt.isoformat(),
+                        "warning": f"Assigned a 3rd Night resource for {chosen_name} to keep Night allocation fair without breaking weekend or bank-holiday staffing rules.",
+                    })
+                    assigned_extra_night = True
+                    break
+
+                if not assigned_extra_night:
+                    warnings.append({
+                        "date": month_dates[0].isoformat(),
+                        "warning": f"Could not assign any Night block to {missing_name} without breaking the existing rota rules.",
+                    })
 
     return planned_night_primaries, reservations, warnings
 
@@ -1225,7 +1325,13 @@ def generate_rota(
         SHIFT_NIGHT: {m.name: 0 for m in members},
     }
     warnings: List[dict] = []
-    planned_night_primaries, night_reservations, planning_warnings = plan_night_shift_blocks(members, leaves, dates, sync_groups)
+    planned_night_primaries, night_reservations, planning_warnings = plan_night_shift_blocks(
+        members,
+        leaves,
+        dates,
+        sync_groups,
+        bank_holidays,
+    )
     warnings.extend(planning_warnings)
 
     for name in member_names:
@@ -2455,6 +2561,7 @@ with st.sidebar:
             - Morning: 2
             - Afternoon: 2
             - Night: 2
+            - Night may temporarily go to 3 on non-restricted days only when needed so every eligible member can still receive a Night block
 
             **Scheduling Rules**
             - One continuous Night block per member per month
