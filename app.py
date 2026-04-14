@@ -23,6 +23,8 @@ ROTA_CSV_FILE = APP_DIR / "rota_saved_matrix.csv"
 STATE_KEY_INPUTS = "saved_inputs"
 STATE_KEY_ROTA = "saved_rota"
 STATE_KEY_AUTH_USERS = "auth_users"
+STATE_KEY_ACTIVITY_LOG = "activity_log"
+ACTIVITY_LOG_LIMIT = 400
 
 SHIFT_MORNING = "Morning"
 SHIFT_AFTERNOON = "Afternoon"
@@ -459,6 +461,18 @@ def parse_specific_bank_holidays(df: pd.DataFrame) -> Set[date]:
             continue
         holiday_dates.add(pd.to_datetime(value).date())
     return holiday_dates
+
+
+def resolve_selected_bank_holidays(
+    start_date: date,
+    end_date: date,
+    bank_holiday_mode: str,
+    auto_bank_holiday_days: int,
+    specific_bank_holiday_df: pd.DataFrame,
+) -> Set[date]:
+    auto_holidays = generate_auto_bank_holidays(start_date, end_date, int(auto_bank_holiday_days)) if bank_holiday_mode in {"By number of days", "Both"} else set()
+    specific_holidays = parse_specific_bank_holidays(specific_bank_holiday_df) if bank_holiday_mode in {"By specific dates", "Both"} else set()
+    return auto_holidays | specific_holidays
 
 
 def parse_sync_groups(df: pd.DataFrame, valid_names: Set[str]) -> Dict[str, List[str]]:
@@ -944,14 +958,70 @@ def repair_single_night_blocks(schedule: Dict[str, Dict[date, str]], member_name
             schedule[swap_out][next_dt] = SHIFT_WEEKOFF
 
 
+def work_streak_if_shift_assigned(
+    schedule: Dict[str, Dict[date, str]],
+    member: str,
+    dt: date,
+    shift: str,
+    dates: List[date],
+    date_index: Dict[date, int],
+) -> int:
+    if not is_working_shift(shift):
+        return 0
+
+    idx = date_index[dt]
+    left = 0
+    scan = idx - 1
+    while scan >= 0 and is_working_shift(schedule[member][dates[scan]]):
+        left += 1
+        scan -= 1
+
+    right = 0
+    scan = idx + 1
+    while scan < len(dates) and is_working_shift(schedule[member][dates[scan]]):
+        right += 1
+        scan += 1
+
+    return left + 1 + right
+
+
+def can_take_rebalanced_shift(
+    schedule: Dict[str, Dict[date, str]],
+    member: str,
+    dt: date,
+    shift: str,
+    dates: List[date],
+    date_index: Dict[date, int],
+    member_map: Dict[str, Member],
+    locked_weekoffs: Set[Tuple[str, date]],
+) -> bool:
+    if schedule[member][dt] != SHIFT_WEEKOFF:
+        return False
+    if (member, dt) in locked_weekoffs:
+        return False
+    if shift not in {SHIFT_MORNING, SHIFT_AFTERNOON}:
+        return False
+
+    member_info = member_map[member]
+    if member_info.afternoon_only:
+        if dt.weekday() >= 5:
+            return False
+        if shift != SHIFT_AFTERNOON:
+            return False
+
+    return work_streak_if_shift_assigned(schedule, member, dt, shift, dates, date_index) <= MAX_CONTINUOUS_WORKING_DAYS
+
+
 def rebalance_weekoff_targets(
     schedule: Dict[str, Dict[date, str]],
     member_names: List[str],
     dates: List[date],
     target_wo: int,
     bank_holidays: Set[date],
+    member_map: Dict[str, Member],
 ):
     locked_weekoffs: Set[Tuple[str, date]] = set()
+    date_index = {dt: idx for idx, dt in enumerate(dates)}
     for name in member_names:
         for idx, dt in enumerate(dates):
             if schedule[name][dt] != SHIFT_NIGHT:
@@ -976,34 +1046,55 @@ def rebalance_weekoff_targets(
         for name in member_names
     }
 
-    over_target = [name for name in member_names if month_wo[name] > target_wo]
-    under_target = [name for name in member_names if month_wo[name] < target_wo]
+    changed = True
+    while changed:
+        changed = False
+        over_target = sorted(
+            [name for name in member_names if month_wo[name] > target_wo],
+            key=lambda name: (month_wo[name], member_map[name].afternoon_only, name.lower()),
+            reverse=True,
+        )
+        under_target = sorted(
+            [name for name in member_names if month_wo[name] < target_wo],
+            key=lambda name: (month_wo[name], name.lower()),
+        )
 
-    for over_name in over_target:
-        for under_name in list(under_target):
+        for over_name in over_target:
             if month_wo[over_name] <= target_wo:
-                break
-            if month_wo[under_name] >= target_wo:
                 continue
 
-            for dt in dates:
-                if is_restricted_staffing_day(dt, bank_holidays):
-                    continue
-                if schedule[over_name][dt] != SHIFT_WEEKOFF:
-                    continue
-                if (over_name, dt) in locked_weekoffs:
-                    continue
-                if schedule[under_name][dt] != SHIFT_AFTERNOON:
+            for under_name in under_target:
+                if over_name == under_name or month_wo[under_name] >= target_wo:
                     continue
 
-                schedule[over_name][dt] = SHIFT_AFTERNOON
-                schedule[under_name][dt] = SHIFT_WEEKOFF
-                month_wo[over_name] -= 1
-                month_wo[under_name] += 1
+                for dt in dates:
+                    transferred_shift = schedule[under_name][dt]
+                    if transferred_shift not in {SHIFT_MORNING, SHIFT_AFTERNOON}:
+                        continue
+                    if not can_take_rebalanced_shift(
+                        schedule,
+                        over_name,
+                        dt,
+                        transferred_shift,
+                        dates,
+                        date_index,
+                        member_map,
+                        locked_weekoffs,
+                    ):
+                        continue
+
+                    schedule[over_name][dt] = transferred_shift
+                    schedule[under_name][dt] = SHIFT_WEEKOFF
+                    month_wo[over_name] -= 1
+                    month_wo[under_name] += 1
+                    changed = True
+                    break
+
+                if changed:
+                    break
+
+            if changed:
                 break
-
-            if month_wo[under_name] >= target_wo:
-                under_target = [name for name in under_target if month_wo[name] < target_wo]
 
 
 def can_assign_shift(name: str, shift: str, dt: date, schedule: Dict[str, Dict[date, str]], stats_map: Dict[str, dict], member_map: Dict[str, Member]) -> bool:
@@ -1303,6 +1394,153 @@ def save_overridden_rota(full_df: pd.DataFrame, metadata: dict, bank_holidays: S
     }
 
 
+MANUAL_SHIFT_VALUE_MAP = {
+    "m": SHIFT_MORNING,
+    "morning": SHIFT_MORNING,
+    "a": SHIFT_AFTERNOON,
+    "afternoon": SHIFT_AFTERNOON,
+    "n": SHIFT_NIGHT,
+    "night": SHIFT_NIGHT,
+    "wo": SHIFT_WEEKOFF,
+    "week off": SHIFT_WEEKOFF,
+    "weekoff": SHIFT_WEEKOFF,
+    "w/o": SHIFT_WEEKOFF,
+    "l": SHIFT_LEAVE,
+    "leave": SHIFT_LEAVE,
+}
+
+
+def build_manual_rota_template_df(members: List[Member], dates: List[date], sync_groups: Dict[str, List[str]]) -> pd.DataFrame:
+    follower_to_primary = {follower: primary for primary, followers in sync_groups.items() for follower in followers}
+    rows: List[dict] = []
+    for member in members:
+        row = {
+            "name": member.name,
+            "dept": member.dept,
+            "file_id": member.file_id,
+            "phone_number": member.phone_number,
+            "primary_for": ", ".join(sync_groups.get(member.name, [])),
+            "synced_to": follower_to_primary.get(member.name, ""),
+        }
+        for dt in dates:
+            row[dt.isoformat()] = ""
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def manual_rota_template_bytes(template_df: pd.DataFrame, start_date: date, end_date: date) -> bytes:
+    instructions_df = pd.DataFrame(
+        [
+            {"field": "Allowed shifts", "value": "Morning, Afternoon, Night, Week Off, Leave"},
+            {"field": "Allowed short codes", "value": "M, A, N, WO, L"},
+            {"field": "Date range", "value": f"{start_date.isoformat()} to {end_date.isoformat()}"},
+            {"field": "Required rows", "value": "Upload all current team members with one row per member"},
+            {"field": "Required date cells", "value": "Fill every rota date cell before uploading"},
+        ]
+    )
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        template_df.to_excel(writer, index=False, sheet_name="Manual Rota Template")
+        instructions_df.to_excel(writer, index=False, sheet_name="Instructions")
+        for sheet_name, df in {"Manual Rota Template": template_df, "Instructions": instructions_df}.items():
+            ws = writer.sheets[sheet_name]
+            for cell in ws[1]:
+                cell.fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+                cell.font = Font(color="FFFFFF", bold=True)
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            for idx, col in enumerate(df.columns, start=1):
+                max_len = max(len(str(col)), *(len(str(v)) for v in df[col].fillna(""))) + 2
+                ws.column_dimensions[get_column_letter(idx)].width = min(max_len, 28)
+    return output.getvalue()
+
+
+def read_uploaded_rota_sheet(uploaded_file) -> pd.DataFrame:
+    suffix = Path(uploaded_file.name).suffix.lower()
+    if suffix == ".csv":
+        return pd.read_csv(uploaded_file)
+
+    excel_file = pd.ExcelFile(uploaded_file)
+    preferred_sheet = next(
+        (sheet_name for sheet_name in ["Manual Rota Template", "Full Shift Matrix"] if sheet_name in excel_file.sheet_names),
+        excel_file.sheet_names[0],
+    )
+    return pd.read_excel(excel_file, sheet_name=preferred_sheet)
+
+
+def normalize_manual_shift_value(raw_value: Any, member_name: str, date_col: str) -> str:
+    if pd.isna(raw_value):
+        raise ValueError(f"Missing shift for {member_name} on {date_col}.")
+    cleaned = str(raw_value).strip()
+    if not cleaned:
+        raise ValueError(f"Missing shift for {member_name} on {date_col}.")
+
+    normalized = MANUAL_SHIFT_VALUE_MAP.get(cleaned.lower())
+    if normalized is None:
+        raise ValueError(
+            f"Invalid shift `{cleaned}` for {member_name} on {date_col}. Use Morning, Afternoon, Night, Week Off, Leave, or M/A/N/WO/L."
+        )
+    return normalized
+
+
+def parse_manual_rota_upload_df(
+    uploaded_df: pd.DataFrame,
+    members: List[Member],
+    dates: List[date],
+    sync_groups: Dict[str, List[str]],
+) -> pd.DataFrame:
+    if uploaded_df.empty:
+        raise ValueError("Uploaded rota file is empty.")
+
+    normalized_columns = {str(col).strip().lower(): col for col in uploaded_df.columns}
+    if "name" not in normalized_columns:
+        raise ValueError("Uploaded rota must include a `name` column.")
+
+    uploaded_df = uploaded_df.copy()
+    name_col = normalized_columns["name"]
+    uploaded_df["__normalized_name__"] = uploaded_df[name_col].astype(str).str.strip()
+    uploaded_df = uploaded_df[uploaded_df["__normalized_name__"] != ""].copy()
+    if uploaded_df.empty:
+        raise ValueError("Uploaded rota does not contain any member rows.")
+
+    if uploaded_df["__normalized_name__"].str.lower().duplicated().any():
+        duplicate_names = sorted(uploaded_df.loc[uploaded_df["__normalized_name__"].str.lower().duplicated(), "__normalized_name__"].unique().tolist())
+        raise ValueError(f"Uploaded rota has duplicate member rows: {', '.join(duplicate_names)}")
+
+    expected_names = {member.name.lower(): member.name for member in members}
+    uploaded_names = {name.lower(): name for name in uploaded_df["__normalized_name__"].tolist()}
+    missing_names = [expected_names[key] for key in expected_names.keys() - uploaded_names.keys()]
+    unexpected_names = [uploaded_names[key] for key in uploaded_names.keys() - expected_names.keys()]
+    if missing_names:
+        raise ValueError(f"Uploaded rota is missing members: {', '.join(sorted(missing_names))}")
+    if unexpected_names:
+        raise ValueError(f"Uploaded rota contains unknown members: {', '.join(sorted(unexpected_names))}")
+
+    expected_date_cols = [dt.isoformat() for dt in dates]
+    date_column_map = {str(col).strip(): col for col in uploaded_df.columns}
+    missing_date_cols = [col for col in expected_date_cols if col not in date_column_map]
+    if missing_date_cols:
+        raise ValueError(f"Uploaded rota is missing date columns: {', '.join(missing_date_cols[:8])}")
+
+    template_df = build_manual_rota_template_df(members, dates, sync_groups)
+    template_index = {str(row["name"]).strip().lower(): idx for idx, row in template_df.iterrows()}
+
+    for _, uploaded_row in uploaded_df.iterrows():
+        canonical_name = expected_names[str(uploaded_row["__normalized_name__"]).strip().lower()]
+        target_idx = template_index[canonical_name.lower()]
+        for date_col in expected_date_cols:
+            source_col = date_column_map[date_col]
+            template_df.at[target_idx, date_col] = normalize_manual_shift_value(uploaded_row[source_col], canonical_name, date_col)
+
+    return normalize_full_rota_df(template_df)
+
+
+def save_manual_uploaded_rota(full_df: pd.DataFrame, metadata: dict, bank_holidays: Set[date]) -> dict:
+    updated_bundle = save_overridden_rota(full_df, metadata, bank_holidays)
+    updated_bundle["metadata"]["manual_upload"] = True
+    return updated_bundle
+
+
 def generate_rota(
     members: List[Member],
     leaves: Dict[str, Set[date]],
@@ -1599,7 +1837,7 @@ def generate_rota(
             else:
                 idx += 1
 
-    rebalance_weekoff_targets(schedule, member_names, dates, target_wo, bank_holidays)
+    rebalance_weekoff_targets(schedule, member_names, dates, target_wo, bank_holidays, member_map)
 
     matrix_rows, full_rows, daywise_rows, summary_rows = [], [], [], []
     sync_map_text = {m.name: ", ".join(sync_groups.get(m.name, [])) for m in members}
@@ -1749,6 +1987,37 @@ def auth_users_df() -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["username", "role"])
 
 
+def log_activity(category: str, action: str, details: str = "", username: Optional[str] = None, role: Optional[str] = None):
+    actor_username = normalize_username(username if username is not None else st.session_state.get("auth_user", "system")) or "system"
+    actor_role = str(role if role is not None else st.session_state.get("auth_role", "system")).strip().lower() or "system"
+    payload = load_state(STATE_KEY_ACTIVITY_LOG) or {}
+    events = payload.get("events", [])
+    events.append(
+        {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "category": str(category).strip() or "General",
+            "action": str(action).strip() or "Activity",
+            "details": str(details).strip(),
+            "username": actor_username,
+            "role": actor_role,
+        }
+    )
+    save_state(STATE_KEY_ACTIVITY_LOG, {"events": events[-ACTIVITY_LOG_LIMIT:]})
+
+
+def activity_log_df() -> pd.DataFrame:
+    payload = load_state(STATE_KEY_ACTIVITY_LOG) or {}
+    rows = payload.get("events", [])
+    if not rows:
+        return pd.DataFrame(columns=["timestamp", "category", "action", "details", "username", "role"])
+    df = pd.DataFrame(rows)
+    expected_columns = ["timestamp", "category", "action", "details", "username", "role"]
+    for column in expected_columns:
+        if column not in df.columns:
+            df[column] = ""
+    return df[expected_columns].sort_values(by=["timestamp", "category", "action"], ascending=[False, True, True]).reset_index(drop=True)
+
+
 def app_state_summary_df() -> pd.DataFrame:
     init_database()
     with sqlite3.connect(DB_FILE) as conn:
@@ -1770,10 +2039,12 @@ def login_user(username: str, password: str) -> bool:
         st.session_state["auth_role"] = user["role"]
         st.session_state["auth_user"] = normalize_username(username)
         st.session_state["auth_logged_in"] = True
+        log_activity("Authentication", "Login", "Signed in successfully.", username=normalize_username(username), role=user["role"])
         return True
     return False
 
 def logout_user():
+    log_activity("Authentication", "Logout", "Signed out of the rota workspace.")
     st.session_state["auth_role"] = "general"
     st.session_state["auth_user"] = "General User"
     st.session_state["auth_logged_in"] = False
@@ -1821,6 +2092,232 @@ def render_inline_note(tone: str, title: str, body: str):
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_dev_console(
+    team_df: pd.DataFrame,
+    leaves_df: pd.DataFrame,
+    sync_groups_df: pd.DataFrame,
+    start_date: date,
+    end_date: date,
+    bank_holiday_mode: str,
+    auto_bank_holiday_days: int,
+    specific_bank_holiday_df: pd.DataFrame,
+):
+    render_section_header("DX", "Developer Console", "Manage app users, roles, activity history, manual rota uploads, and local maintenance tasks from one place.")
+    render_inline_note("info", "Local authentication", "Usernames, passwords, roles, and activity history are stored locally in the rota database for this app.")
+
+    console_tabs = st.tabs(["Users", "Activity", "Manual ROTA", "Maintenance"])
+
+    with console_tabs[0]:
+        users_df = auth_users_df()
+        admin_count = int((users_df["role"] == "admin").sum()) if not users_df.empty else 0
+        dev_count = int((users_df["role"] == "dev").sum()) if not users_df.empty else 0
+        member_count = int((users_df["role"] == "member").sum()) if not users_df.empty else 0
+
+        metric_1, metric_2, metric_3, metric_4 = st.columns(4)
+        with metric_1:
+            st.metric("Total users", int(len(users_df)))
+        with metric_2:
+            st.metric("Admins", admin_count)
+        with metric_3:
+            st.metric("Devs", dev_count)
+        with metric_4:
+            st.metric("Members", member_count)
+
+        st.markdown("#### Current users")
+        st.dataframe(users_df, width="stretch", hide_index=True)
+
+        manage_left, manage_right = st.columns(2)
+        with manage_left:
+            st.markdown("#### Add or update user")
+            with st.form("dev_user_upsert_form", clear_on_submit=True):
+                managed_username = st.text_input("Username")
+                managed_password = st.text_input(
+                    "Password",
+                    type="password",
+                    help="For an existing user, you can leave this blank to keep the current password and update only the role.",
+                )
+                managed_role = st.selectbox("Role", options=["member", "dev", "admin"], index=0)
+                save_user_clicked = st.form_submit_button("Save User", width="stretch")
+            if save_user_clicked:
+                try:
+                    upsert_auth_user(managed_username, managed_password, managed_role)
+                    normalized_managed_user = normalize_username(managed_username)
+                    if normalized_managed_user == normalize_username(st.session_state.get("auth_user", "")):
+                        st.session_state["auth_role"] = managed_role
+                    log_activity("User Management", "Save User", f"Saved user `{normalized_managed_user}` with role `{managed_role}`.")
+                    st.success(f"User `{normalized_managed_user}` saved.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+
+        with manage_right:
+            st.markdown("#### Remove user")
+            current_user = normalize_username(st.session_state.get("auth_user", ""))
+            delete_candidates = [user for user in users_df["username"].tolist() if user != current_user] if not users_df.empty else []
+            delete_options = delete_candidates if delete_candidates else ["No removable users"]
+            with st.form("dev_user_delete_form"):
+                user_to_delete = st.selectbox(
+                    "Select user",
+                    options=delete_options,
+                    disabled=not delete_candidates,
+                )
+                delete_user_clicked = st.form_submit_button("Delete User", width="stretch", disabled=not delete_candidates)
+            if delete_user_clicked:
+                try:
+                    delete_auth_user(user_to_delete, st.session_state.get("auth_user", ""))
+                    log_activity("User Management", "Delete User", f"Deleted user `{user_to_delete}`.")
+                    st.success(f"User `{user_to_delete}` deleted.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+
+    with console_tabs[1]:
+        activity_df = activity_log_df()
+        if activity_df.empty:
+            st.caption("No user activity has been recorded yet.")
+        else:
+            summary_df = (
+                activity_df.groupby("category", as_index=False)
+                .agg(events=("action", "count"), latest=("timestamp", "max"))
+                .sort_values(by=["events", "category"], ascending=[False, True])
+            )
+
+            top_a, top_b, top_c = st.columns(3)
+            with top_a:
+                st.metric("Activity events", int(len(activity_df)))
+            with top_b:
+                st.metric("Categories", int(summary_df.shape[0]))
+            with top_c:
+                st.metric("Latest event", str(activity_df.iloc[0]["timestamp"]))
+
+            st.markdown("#### Activity by category")
+            st.dataframe(summary_df, width="stretch", hide_index=True)
+
+            category_order = ["Authentication", "User Management", "Inputs", "Rota", "Maintenance"]
+            available_categories = [category for category in category_order if category in activity_df["category"].tolist()]
+            remaining_categories = sorted([category for category in activity_df["category"].unique().tolist() if category not in available_categories])
+            activity_tabs = st.tabs(["All Activity"] + available_categories + remaining_categories)
+
+            with activity_tabs[0]:
+                st.dataframe(activity_df, width="stretch", hide_index=True)
+
+            for tab_index, category in enumerate(available_categories + remaining_categories, start=1):
+                with activity_tabs[tab_index]:
+                    category_df = activity_df[activity_df["category"] == category].reset_index(drop=True)
+                    st.dataframe(category_df, width="stretch", hide_index=True)
+
+    with console_tabs[2]:
+        st.markdown("#### Manual ROTA upload")
+        st.caption("Upload a completed rota file to create or replace the saved snapshot. The upload should follow the provided full-shift template.")
+
+        if end_date < start_date:
+            st.error("End date must be on or after start date before a manual rota can be uploaded.")
+        else:
+            try:
+                members = parse_members(team_df)
+                valid_names = {member.name for member in members}
+                current_sync_groups = parse_sync_groups(sync_groups_df, valid_names)
+                manual_dates = dates_in_range(start_date, end_date)
+                manual_bank_holidays = resolve_selected_bank_holidays(
+                    start_date,
+                    end_date,
+                    bank_holiday_mode,
+                    auto_bank_holiday_days,
+                    specific_bank_holiday_df,
+                )
+                template_df = build_manual_rota_template_df(members, manual_dates, current_sync_groups)
+                template_bytes = manual_rota_template_bytes(template_df, start_date, end_date)
+
+                upload_col, template_col = st.columns([1.6, 1])
+                with upload_col:
+                    uploaded_manual_rota = st.file_uploader(
+                        "Upload manual rota file",
+                        type=["xlsx", "xls", "csv"],
+                        accept_multiple_files=False,
+                        key="manual_rota_upload",
+                        help="Use the template and fill every date cell with Morning, Afternoon, Night, Week Off, Leave, or M/A/N/WO/L.",
+                    )
+                with template_col:
+                    st.download_button(
+                        "Download Manual ROTA Template",
+                        data=template_bytes,
+                        file_name=f"manual_rota_template_{start_date.isoformat()}_{end_date.isoformat()}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        width="stretch",
+                    )
+
+                st.dataframe(template_df.head(min(5, len(template_df))), width="stretch", hide_index=True)
+
+                if uploaded_manual_rota is not None:
+                    try:
+                        uploaded_manual_df = read_uploaded_rota_sheet(uploaded_manual_rota)
+                        parsed_manual_rota_df = parse_manual_rota_upload_df(
+                            uploaded_manual_df,
+                            members,
+                            manual_dates,
+                            current_sync_groups,
+                        )
+                        st.success(f"Validated manual rota file `{uploaded_manual_rota.name}` for {len(parsed_manual_rota_df)} members.")
+                        st.dataframe(parsed_manual_rota_df.head(min(8, len(parsed_manual_rota_df))), width="stretch", hide_index=True)
+
+                        if st.button("Save Uploaded ROTA", type="primary", width="stretch"):
+                            save_inputs(team_df, leaves_df, specific_bank_holiday_df, sync_groups_df)
+                            metadata = {
+                                "start_date": start_date.isoformat(),
+                                "end_date": end_date.isoformat(),
+                            }
+                            updated_bundle = save_manual_uploaded_rota(parsed_manual_rota_df, metadata, manual_bank_holidays)
+                            st.session_state["rota_bundle"] = updated_bundle
+                            log_activity(
+                                "Rota",
+                                "Manual Rota Upload",
+                                f"Uploaded manual rota from `{uploaded_manual_rota.name}` for {start_date.isoformat()} to {end_date.isoformat()}.",
+                            )
+                            st.success("Manual rota uploaded and saved to the database.")
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not load the uploaded rota: {e}")
+            except Exception as e:
+                st.error(f"Manual rota upload is unavailable until the team and sync-group data are valid: {e}")
+
+    with console_tabs[3]:
+        render_section_header("DB", "Storage And Maintenance", "Inspect saved state and use a few safe maintenance actions for local development.")
+        state_df = app_state_summary_df()
+        if state_df.empty:
+            st.caption("No database-backed state entries were found yet.")
+        else:
+            st.dataframe(state_df, width="stretch", hide_index=True)
+
+        tools_left, tools_middle, tools_right = st.columns(3)
+        with tools_left:
+            if st.button("Clear Saved ROTA Snapshot", width="stretch"):
+                delete_state(STATE_KEY_ROTA)
+                if ROTA_EXCEL_FILE.exists():
+                    ROTA_EXCEL_FILE.unlink()
+                if ROTA_CSV_FILE.exists():
+                    ROTA_CSV_FILE.unlink()
+                st.session_state["rota_bundle"] = None
+                log_activity("Maintenance", "Clear Saved ROTA Snapshot", "Deleted the saved rota snapshot and local rota exports.")
+                st.success("Saved rota snapshot cleared from the database and local exports.")
+                st.rerun()
+        with tools_middle:
+            if st.button("Clear Team Import Draft", width="stretch"):
+                st.session_state["team_import_df"] = None
+                log_activity("Maintenance", "Clear Team Import Draft", "Cleared the current team import draft from the session.")
+                st.success("Team import draft cleared from the current session.")
+        with tools_right:
+            if st.button("Restore Default Users", width="stretch"):
+                save_auth_users({username: dict(config) for username, config in DEFAULT_AUTH_USERS.items()})
+                current_user = normalize_username(st.session_state.get("auth_user", ""))
+                if current_user in DEFAULT_AUTH_USERS:
+                    st.session_state["auth_role"] = DEFAULT_AUTH_USERS[current_user]["role"]
+                else:
+                    logout_user()
+                log_activity("Maintenance", "Restore Default Users", "Restored the default local user accounts.")
+                st.success("Default users restored.")
+                st.rerun()
 
 
 # -----------------------------
@@ -2659,6 +3156,7 @@ if can_manage:
             try:
                 save_inputs(team_df, leaves_default_df, bank_holidays_default_df, sync_groups_default_df)
                 st.session_state["team_import_df"] = team_df.copy()
+                log_activity("Inputs", "Save Team Details", f"Saved {len(team_df)} team member rows.")
                 st.success("Team details saved to the database.")
             except Exception as e:
                 st.error(f"Could not save team details: {e}")
@@ -2668,6 +3166,7 @@ if can_manage:
             st.session_state["team_import_df"] = None
             if DATA_FILE.exists():
                 DATA_FILE.unlink()
+            log_activity("Inputs", "Reset Saved Input Data", "Cleared the saved team/input data snapshot.")
             st.success("Saved input data cleared from the database. Refresh the app.")
 
     render_section_header("02", "Leaves", "Capture leave ranges so rota generation respects planned absences.")
@@ -2731,6 +3230,7 @@ if can_manage:
         try:
             save_inputs(team_df, leaves_df, specific_bh_df, sync_groups_df)
             st.session_state["team_import_df"] = team_df.copy()
+            log_activity("Inputs", "Save All Inputs", f"Saved inputs for {start_date.isoformat()} to {end_date.isoformat()}.")
             st.success("Inputs saved to the database.")
         except Exception as e:
             st.error(f"Could not save inputs: {e}")
@@ -2745,9 +3245,7 @@ if can_manage:
             valid_names = {m.name for m in members}
             leaves_map = parse_leaves(leaves_df, valid_names)
             sync_groups = parse_sync_groups(sync_groups_df, valid_names)
-            auto_holidays = generate_auto_bank_holidays(start_date, end_date, int(auto_bh_days))
-            specific_holidays = parse_specific_bank_holidays(specific_bh_df) if bh_mode in {"By specific dates", "Both"} else set()
-            bank_holidays = auto_holidays | specific_holidays
+            bank_holidays = resolve_selected_bank_holidays(start_date, end_date, bh_mode, int(auto_bh_days), specific_bh_df)
 
             save_inputs(team_df, leaves_df, specific_bh_df, sync_groups_df)
 
@@ -2778,6 +3276,7 @@ if can_manage:
                 "excel_bytes": excel_bytes,
             }
             st.session_state["rota_bundle"] = rota_bundle
+            log_activity("Rota", "Generate ROTA", f"Generated rota for {start_date.isoformat()} to {end_date.isoformat()}.")
             st.success("ROTA generated and saved to the database.")
         except Exception as e:
             st.error(str(e))
@@ -2946,6 +3445,7 @@ if rota_bundle is not None:
                 try:
                     updated_bundle = save_overridden_rota(edited_full_df, rota_bundle["metadata"], bank_holidays)
                     st.session_state["rota_bundle"] = updated_bundle
+                    log_activity("Rota", "Save Manual Overrides", "Saved manual shift overrides for the current rota snapshot.")
                     st.success("Manual overrides saved to the database.")
                     st.rerun()
                 except Exception as e:
@@ -2953,101 +3453,16 @@ if rota_bundle is not None:
 
     if dev_tab is not None:
         with dev_tab:
-            render_section_header("DX", "Developer Console", "Manage app users, roles, and local maintenance tasks from one place.")
-            render_inline_note("info", "Local authentication", "Usernames, passwords, and roles are stored locally in the rota database for this app.")
-
-            users_df = auth_users_df()
-            admin_count = int((users_df["role"] == "admin").sum()) if not users_df.empty else 0
-            dev_count = int((users_df["role"] == "dev").sum()) if not users_df.empty else 0
-            member_count = int((users_df["role"] == "member").sum()) if not users_df.empty else 0
-
-            metric_1, metric_2, metric_3, metric_4 = st.columns(4)
-            with metric_1:
-                st.metric("Total users", int(len(users_df)))
-            with metric_2:
-                st.metric("Admins", admin_count)
-            with metric_3:
-                st.metric("Devs", dev_count)
-            with metric_4:
-                st.metric("Members", member_count)
-
-            st.markdown("#### Current users")
-            st.dataframe(users_df, width="stretch", hide_index=True)
-
-            manage_left, manage_right = st.columns(2)
-            with manage_left:
-                st.markdown("#### Add or update user")
-                with st.form("dev_user_upsert_form", clear_on_submit=True):
-                    managed_username = st.text_input("Username")
-                    managed_password = st.text_input(
-                        "Password",
-                        type="password",
-                        help="For an existing user, you can leave this blank to keep the current password and update only the role.",
-                    )
-                    managed_role = st.selectbox("Role", options=["member", "dev", "admin"], index=0)
-                    save_user_clicked = st.form_submit_button("Save User", width="stretch")
-                if save_user_clicked:
-                    try:
-                        upsert_auth_user(managed_username, managed_password, managed_role)
-                        if normalize_username(managed_username) == normalize_username(st.session_state.get("auth_user", "")):
-                            st.session_state["auth_role"] = managed_role
-                        st.success(f"User `{normalize_username(managed_username)}` saved.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(str(e))
-
-            with manage_right:
-                st.markdown("#### Remove user")
-                current_user = normalize_username(st.session_state.get("auth_user", ""))
-                delete_candidates = [user for user in users_df["username"].tolist() if user != current_user] if not users_df.empty else []
-                delete_options = delete_candidates if delete_candidates else ["No removable users"]
-                with st.form("dev_user_delete_form"):
-                    user_to_delete = st.selectbox(
-                        "Select user",
-                        options=delete_options,
-                        disabled=not delete_candidates,
-                    )
-                    delete_user_clicked = st.form_submit_button("Delete User", width="stretch", disabled=not delete_candidates)
-                if delete_user_clicked:
-                    try:
-                        delete_auth_user(user_to_delete, st.session_state.get("auth_user", ""))
-                        st.success(f"User `{user_to_delete}` deleted.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(str(e))
-
-            render_section_header("DB", "Storage And Maintenance", "Inspect saved state and use a few safe maintenance actions for local development.")
-            state_df = app_state_summary_df()
-            if state_df.empty:
-                st.caption("No database-backed state entries were found yet.")
-            else:
-                st.dataframe(state_df, width="stretch", hide_index=True)
-
-            tools_left, tools_middle, tools_right = st.columns(3)
-            with tools_left:
-                if st.button("Clear Saved ROTA Snapshot", width="stretch"):
-                    delete_state(STATE_KEY_ROTA)
-                    if ROTA_EXCEL_FILE.exists():
-                        ROTA_EXCEL_FILE.unlink()
-                    if ROTA_CSV_FILE.exists():
-                        ROTA_CSV_FILE.unlink()
-                    st.session_state["rota_bundle"] = None
-                    st.success("Saved rota snapshot cleared from the database and local exports.")
-                    st.rerun()
-            with tools_middle:
-                if st.button("Clear Team Import Draft", width="stretch"):
-                    st.session_state["team_import_df"] = None
-                    st.success("Team import draft cleared from the current session.")
-            with tools_right:
-                if st.button("Restore Default Users", width="stretch"):
-                    save_auth_users({username: dict(config) for username, config in DEFAULT_AUTH_USERS.items()})
-                    current_user = normalize_username(st.session_state.get("auth_user", ""))
-                    if current_user in DEFAULT_AUTH_USERS:
-                        st.session_state["auth_role"] = DEFAULT_AUTH_USERS[current_user]["role"]
-                    else:
-                        logout_user()
-                    st.success("Default users restored.")
-                    st.rerun()
+            render_dev_console(
+                team_df=team_df,
+                leaves_df=leaves_df,
+                sync_groups_df=sync_groups_df,
+                start_date=start_date,
+                end_date=end_date,
+                bank_holiday_mode=bh_mode,
+                auto_bank_holiday_days=int(auto_bh_days),
+                specific_bank_holiday_df=specific_bh_df,
+            )
 
     if can_manage:
         d1, d2 = st.columns(2)
@@ -3070,5 +3485,15 @@ if rota_bundle is not None:
 else:
     if can_manage:
         render_inline_note("info", "No rota yet", "Generate a rota to unlock the schedule tabs, exports, and change-support availability views.")
+        render_dev_console(
+            team_df=team_df,
+            leaves_df=leaves_df,
+            sync_groups_df=sync_groups_df,
+            start_date=start_date,
+            end_date=end_date,
+            bank_holiday_mode=bh_mode,
+            auto_bank_holiday_days=int(auto_bh_days),
+            specific_bank_holiday_df=specific_bh_df,
+        )
     else:
         render_inline_note("warning", "No saved rota found", "Ask an Admin or Dev to generate the rota first so the saved schedule can be viewed here.")
