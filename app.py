@@ -1,2126 +1,3499 @@
-from __future__ import annotations
 
-import html
-import hashlib
-import hmac
+import calendar
+import io
 import json
-import os
-import smtplib
 import sqlite3
-from contextlib import closing
-from datetime import date, datetime
-from email.message import EmailMessage
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+from html import escape
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-import altair as alt
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
+APP_DIR = Path(__file__).resolve().parent
+DB_FILE = APP_DIR / "rota.db"
+DATA_FILE = APP_DIR / "rota_saved_inputs.json"
+ROTA_FILE = APP_DIR / "rota_saved_output.json"
+ROTA_EXCEL_FILE = APP_DIR / "rota_saved_output.xlsx"
+ROTA_CSV_FILE = APP_DIR / "rota_saved_matrix.csv"
+STATE_KEY_INPUTS = "saved_inputs"
+STATE_KEY_ROTA = "saved_rota"
+STATE_KEY_AUTH_USERS = "auth_users"
+STATE_KEY_ACTIVITY_LOG = "activity_log"
+ACTIVITY_LOG_LIMIT = 400
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DB_FILE = DATA_DIR / "expense_tracker.db"
-LEGACY_TRANSACTIONS_FILE = DATA_DIR / "transactions.csv"
-LEGACY_CATEGORIES_FILE = DATA_DIR / "categories.json"
+SHIFT_MORNING = "Morning"
+SHIFT_AFTERNOON = "Afternoon"
+SHIFT_NIGHT = "Night"
+SHIFT_WEEKOFF = "Week Off"
+SHIFT_LEAVE = "Leave"
+SHIFT_UNASSIGNED = "Unassigned"
 
-TYPE_LABELS = {"expense": "Expense", "credit": "Credit"}
-ADD_CUSTOM_OPTION = "Add a new category..."
-ADMIN_NOTIFICATION_EMAILS = ["sricharan2209@gmail.com"]
-DEV_ACCOUNT_EMAIL = os.getenv("DEV_ACCOUNT_EMAIL", "developer@local.app")
-DEV_ACCOUNT_USERNAME = os.getenv("DEV_ACCOUNT_USERNAME", "developer")
-DEV_ACCOUNT_PASSWORD = os.getenv("DEV_ACCOUNT_PASSWORD", "developer123")
-DASHBOARD_SECTION_KEY = "dashboard_section"
-ADMIN_SECTION_KEY = "admin_section"
-DEFAULT_CATEGORIES = {
-    "expense": [
-        "Transport",
-        "Petrol",
-        "Food",
-        "Clothing",
-        "Shopping",
-        "Home",
-        "Home Office",
-        "Office",
-        "Relatives",
-        "Groceries",
-        "Utilities",
-        "Medical",
-        "Entertainment",
-        "Travel",
-        "Education",
-        "Subscriptions",
-        "Bills",
-        "EMI",
-        "Other Expense",
-    ],
-    "credit": [
-        "Salary Credit",
-        "Bonus",
-        "Refund",
-        "Freelance",
-        "Interest",
-        "Investment Return",
-        "Gift Received",
-        "Rental Income",
-        "Reimbursement",
-        "Other Credit",
-    ],
+SHIFT_CODE_MAP = {
+    SHIFT_MORNING: "M",
+    SHIFT_AFTERNOON: "A",
+    SHIFT_NIGHT: "N",
+    SHIFT_WEEKOFF: "WO",
+    SHIFT_LEAVE: "L",
+    SHIFT_UNASSIGNED: "-",
 }
 
+SHIFT_COLOR_MAP = {
+    SHIFT_MORNING: "#123A63",
+    SHIFT_AFTERNOON: "#5B341C",
+    SHIFT_NIGHT: "#33214F",
+    SHIFT_WEEKOFF: "#1E4A3A",
+    SHIFT_LEAVE: "#5A1F2B",
+    SHIFT_UNASSIGNED: "#20293A",
+    "BANK_HOLIDAY_HEADER": "#173B5E",
+}
 
-def apply_custom_styles() -> None:
-    st.markdown(
-        """
-        <style>
-        .stApp {
-            background: linear-gradient(180deg, #f7fafc 0%, #edf4fb 100%);
-        }
-        ::selection {
-            background: #16a34a;
-            color: #ffffff;
-        }
-        ::-moz-selection {
-            background: #16a34a;
-            color: #ffffff;
-        }
-        @media (prefers-color-scheme: dark) {
-            .stApp {
-                background: #000000 !important;
-            }
-            [data-testid="stAppViewContainer"] {
-                background: #000000 !important;
-            }
-            [data-testid="stHeader"] {
-                background: rgba(0, 0, 0, 0.92) !important;
-            }
-            .section-hint,
-            .insight-card,
-            .tx-card,
-            div[data-testid="stForm"],
-            div[data-testid="stExpander"] details,
-            [data-testid="stMetric"] {
-                background: #0b0b0b !important;
-                border-color: #222222 !important;
-                color: #f5f5f5 !important;
-                box-shadow: none !important;
-            }
-            .muted-copy,
-            .insight-label,
-            .tx-meta {
-                color: #b3b3b3 !important;
-            }
-            .insight-value,
-            .tx-title,
-            .stMarkdown,
-            label,
-            p,
-            h1,
-            h2,
-            h3 {
-                color: #f5f5f5 !important;
-            }
-            .chip {
-                background: #111111 !important;
-                color: #7dd3fc !important;
-                border-color: #1f2937 !important;
-            }
-            [data-baseweb="tab"] {
-                background: #111111 !important;
-                color: #e5e7eb !important;
-            }
-            [data-baseweb="tab"][aria-selected="true"] {
-                background: #16a34a !important;
-                color: #ffffff !important;
-            }
-            div.stButton > button,
-            div.stDownloadButton > button {
-                background: #111111 !important;
-                color: #f5f5f5 !important;
-                border-color: #2a2a2a !important;
-            }
-        }
-        .block-container {
-            max-width: 1080px;
-            padding-top: 1rem;
-            padding-bottom: 4rem;
-            padding-left: 1rem;
-            padding-right: 1rem;
-        }
-        @media (max-width: 768px) {
-            .block-container {
-                padding-top: 0.75rem;
-                padding-left: 0.8rem;
-                padding-right: 0.8rem;
-            }
-        }
-        [data-testid="stMetric"] {
-            background: rgba(255, 255, 255, 0.95);
-            border: 1px solid #d9e4f0;
-            border-radius: 18px;
-            padding: 0.95rem;
-            box-shadow: 0 10px 28px rgba(15, 23, 42, 0.06);
-        }
-        div.stButton > button,
-        div.stDownloadButton > button {
-            min-height: 3rem;
-            border-radius: 14px;
-            font-weight: 600;
-            border: 1px solid #cfd9e8;
-        }
-        [data-baseweb="tab-list"] {
-            gap: 0.5rem;
-            flex-wrap: wrap;
-        }
-        [data-baseweb="tab"] {
-            height: auto;
-            padding: 0.5rem 1rem;
-            border-radius: 999px;
-            background: #e8eff7;
-        }
-        [data-baseweb="tab"][aria-selected="true"] {
-            background: #16a34a;
-            color: white;
-        }
-        input[type="checkbox"] {
-            accent-color: #16a34a;
-        }
-        div[data-testid="stForm"] {
-            background: rgba(255, 255, 255, 0.92);
-            border: 1px solid #dbe5ef;
-            border-radius: 18px;
-            padding: 1rem;
-        }
-        div[data-testid="stExpander"] details {
-            border: 1px solid #dbe5ef;
-            border-radius: 18px;
-            background: rgba(255, 255, 255, 0.92);
-        }
-        .hero-card {
-            background: linear-gradient(135deg, #0f172a 0%, #0f766e 100%);
-            color: white;
-            border-radius: 24px;
-            padding: 1.25rem;
-            margin-bottom: 1rem;
-            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.18);
-        }
-        .hero-eyebrow {
-            text-transform: uppercase;
-            letter-spacing: 0.12em;
-            font-size: 0.78rem;
-            opacity: 0.8;
-            margin-bottom: 0.35rem;
-        }
-        .hero-title {
-            font-size: 1.9rem;
-            line-height: 1.1;
-            font-weight: 700;
-            margin: 0;
-        }
-        .hero-copy {
-            margin-top: 0.55rem;
-            color: rgba(255, 255, 255, 0.86);
-            max-width: 38rem;
-        }
-        .hero-stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 0.75rem;
-            margin-top: 1rem;
-        }
-        .hero-stat {
-            background: rgba(255, 255, 255, 0.12);
-            border: 1px solid rgba(255, 255, 255, 0.14);
-            border-radius: 18px;
-            padding: 0.85rem;
-        }
-        .hero-stat-label {
-            font-size: 0.82rem;
-            opacity: 0.82;
-        }
-        .hero-stat-value {
-            font-size: 1.1rem;
-            font-weight: 700;
-            margin-top: 0.2rem;
-        }
-        .chip-row {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 0.45rem;
-            margin-top: 0.7rem;
-        }
-        .chip {
-            padding: 0.28rem 0.7rem;
-            border-radius: 999px;
-            background: #eef8f7;
-            color: #0f766e;
-            border: 1px solid #cde8e3;
-            font-size: 0.85rem;
-        }
-        .insight-card,
-        .tx-card {
-            background: rgba(255, 255, 255, 0.96);
-            border: 1px solid #dbe5ef;
-            border-radius: 18px;
-            padding: 0.95rem;
-            box-shadow: 0 10px 26px rgba(15, 23, 42, 0.05);
-        }
-        .insight-card {
-            height: 100%;
-        }
-        .insight-label,
-        .tx-meta,
-        .muted-copy {
-            color: #526071;
-            font-size: 0.92rem;
-        }
-        .insight-value {
-            font-size: 1.05rem;
-            font-weight: 700;
-            color: #0f172a;
-            margin-top: 0.2rem;
-        }
-        .tx-top {
-            display: flex;
-            justify-content: space-between;
-            gap: 0.8rem;
-            align-items: flex-start;
-            margin-bottom: 0.4rem;
-        }
-        .tx-title {
-            font-weight: 700;
-            color: #0f172a;
-        }
-        .tx-amount {
-            font-weight: 700;
-            white-space: nowrap;
-        }
-        .tx-amount.expense {
-            color: #b42318;
-        }
-        .tx-amount.credit {
-            color: #0f766e;
-        }
-        .section-hint {
-            background: rgba(255, 255, 255, 0.82);
-            border: 1px solid #dbe5ef;
-            border-radius: 16px;
-            padding: 0.85rem 1rem;
-            margin-bottom: 1rem;
-            color: #334155;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+# GMT shift timings
+SHIFT_TIME_MAP = {
+    SHIFT_MORNING: (time(1, 0), time(10, 30)),
+    SHIFT_AFTERNOON: (time(7, 30), time(17, 0)),
+    SHIFT_NIGHT: (time(15, 30), time(1, 0)),  # ends next day
+}
+
+MIN_MORNING = 2
+MIN_AFTERNOON = 2
+MIN_NIGHT = 2
+MAX_CONTINUOUS_NIGHT = 5
+MANDATORY_OFF_AFTER_NIGHT = 2
+MAX_CONTINUOUS_WORKING_DAYS = 6
 
 
-def normalize_category(name: str) -> str:
-    return " ".join(name.strip().split()).title()
-
-
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
-
-
-def verify_password(password: str, password_hash: str) -> bool:
-    return hmac.compare_digest(hash_password(password), password_hash)
-
-
-def get_connection() -> sqlite3.Connection:
-    DATA_DIR.mkdir(exist_ok=True)
-    connection = sqlite3.connect(DB_FILE, check_same_thread=False)
-    connection.row_factory = sqlite3.Row
-    return connection
-
-
-def table_has_column(connection: sqlite3.Connection, table_name: str, column_name: str) -> bool:
-    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return any(row["name"] == column_name for row in rows)
-
-
-def init_db() -> None:
-    with closing(get_connection()) as connection:
-        connection.execute(
+def init_database():
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                full_name TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'user',
-                is_active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL,
-                last_recap_month TEXT
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS categories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                transaction_type TEXT NOT NULL,
-                name TEXT NOT NULL,
-                is_default INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                UNIQUE(user_id, transaction_type, name),
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                transaction_date TEXT NOT NULL,
-                transaction_type TEXT NOT NULL,
-                category TEXT NOT NULL,
-                amount REAL NOT NULL,
-                notes TEXT DEFAULT '',
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS notifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT NOT NULL,
-                recipient_email TEXT NOT NULL,
-                subject TEXT NOT NULL,
-                body TEXT NOT NULL,
-                status TEXT NOT NULL,
-                error_message TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS app_settings (
-                setting_key TEXT PRIMARY KEY,
-                setting_value TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS app_state (
+                state_key TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
-
-        if not table_has_column(connection, "users", "last_login_at"):
-            connection.execute("ALTER TABLE users ADD COLUMN last_login_at TEXT")
-
-        connection.commit()
-
-    ensure_developer_account()
-    migrate_legacy_files()
+        conn.commit()
 
 
-def ensure_developer_account() -> None:
-    now = datetime.now().isoformat()
-    with closing(get_connection()) as connection:
-        existing = connection.execute(
-            "SELECT id FROM users WHERE username = ?",
-            (DEV_ACCOUNT_USERNAME,),
-        ).fetchone()
-        if not existing:
-            connection.execute(
-                """
-                INSERT INTO users (username, full_name, email, password_hash, role, is_active, created_at)
-                VALUES (?, ?, ?, ?, 'developer', 1, ?)
-                """,
-                (
-                    DEV_ACCOUNT_USERNAME,
-                    "Developer Account",
-                    DEV_ACCOUNT_EMAIL,
-                    hash_password(DEV_ACCOUNT_PASSWORD),
-                    now,
-                ),
-            )
-            connection.commit()
-
-    dev_user = get_user_by_username(DEV_ACCOUNT_USERNAME)
-    if dev_user:
-        ensure_default_categories(dev_user["id"])
+def json_default(value: Any) -> str:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
-def migrate_legacy_files() -> None:
-    if not LEGACY_TRANSACTIONS_FILE.exists() and not LEGACY_CATEGORIES_FILE.exists():
-        return
-
-    dev_user = get_user_by_username(DEV_ACCOUNT_USERNAME)
-    if not dev_user:
-        return
-
-    with closing(get_connection()) as connection:
-        existing_count = connection.execute(
-            "SELECT COUNT(*) AS count FROM transactions WHERE user_id = ?",
-            (dev_user["id"],),
-        ).fetchone()["count"]
-
-    if existing_count == 0 and LEGACY_TRANSACTIONS_FILE.exists():
-        try:
-            legacy_transactions = pd.read_csv(LEGACY_TRANSACTIONS_FILE)
-        except Exception:
-            legacy_transactions = pd.DataFrame()
-
-        if not legacy_transactions.empty:
-            legacy_transactions = legacy_transactions.fillna("")
-            with closing(get_connection()) as connection:
-                for _, row in legacy_transactions.iterrows():
-                    transaction_date = pd.to_datetime(row.get("date"), errors="coerce")
-                    transaction_type = str(row.get("type", "")).strip().lower()
-                    category = normalize_category(str(row.get("category", "")).strip())
-                    amount = pd.to_numeric(row.get("amount"), errors="coerce")
-                    notes = str(row.get("notes", "")).strip()
-
-                    if pd.isna(transaction_date) or transaction_type not in TYPE_LABELS:
-                        continue
-                    if pd.isna(amount):
-                        continue
-
-                    connection.execute(
-                        """
-                        INSERT INTO transactions
-                        (user_id, transaction_date, transaction_type, category, amount, notes, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            dev_user["id"],
-                            transaction_date.strftime("%Y-%m-%d"),
-                            transaction_type,
-                            category or "Other Expense",
-                            float(amount),
-                            notes,
-                            datetime.now().isoformat(),
-                        ),
-                    )
-                connection.commit()
-
-    if LEGACY_CATEGORIES_FILE.exists():
-        try:
-            raw_categories = json.loads(LEGACY_CATEGORIES_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            raw_categories = {}
-        for transaction_type, names in raw_categories.items():
-            for name in names:
-                add_category_for_user(dev_user["id"], transaction_type, str(name), is_default=False)
-
-
-def get_user_by_username(username: str) -> dict[str, Any] | None:
-    with closing(get_connection()) as connection:
-        row = connection.execute(
-            "SELECT * FROM users WHERE lower(username) = lower(?)",
-            (username,),
-        ).fetchone()
-    return dict(row) if row else None
-
-
-def get_user_by_id(user_id: int) -> dict[str, Any] | None:
-    with closing(get_connection()) as connection:
-        row = connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    return dict(row) if row else None
-
-
-def list_users() -> pd.DataFrame:
-    with closing(get_connection()) as connection:
-        rows = connection.execute(
+def save_state(state_key: str, payload: dict):
+    init_database()
+    serialized = json.dumps(payload, indent=2, default=json_default)
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
             """
-            SELECT id, username, full_name, email, role, is_active, created_at, last_login_at, last_recap_month
-            FROM users
-            ORDER BY created_at DESC
-            """
-        ).fetchall()
-    return pd.DataFrame([dict(row) for row in rows])
-
-
-def save_setting(setting_key: str, setting_value: str) -> None:
-    with closing(get_connection()) as connection:
-        connection.execute(
-            """
-            INSERT INTO app_settings (setting_key, setting_value, updated_at)
+            INSERT INTO app_state(state_key, payload, updated_at)
             VALUES (?, ?, ?)
-            ON CONFLICT(setting_key) DO UPDATE SET
-                setting_value = excluded.setting_value,
+            ON CONFLICT(state_key) DO UPDATE SET
+                payload = excluded.payload,
                 updated_at = excluded.updated_at
             """,
-            (setting_key, setting_value, datetime.now().isoformat()),
+            (state_key, serialized, datetime.utcnow().isoformat(timespec="seconds")),
         )
-        connection.commit()
+        conn.commit()
 
 
-def get_setting(setting_key: str, default: str = "") -> str:
-    with closing(get_connection()) as connection:
-        row = connection.execute(
-            "SELECT setting_value FROM app_settings WHERE setting_key = ?",
-            (setting_key,),
+def load_state(state_key: str) -> Optional[dict]:
+    init_database()
+    with sqlite3.connect(DB_FILE) as conn:
+        row = conn.execute(
+            "SELECT payload FROM app_state WHERE state_key = ?",
+            (state_key,),
         ).fetchone()
-    return row["setting_value"] if row else default
-
-
-def get_smtp_config() -> dict[str, str]:
-    return {
-        "host": os.getenv("SMTP_HOST") or get_setting("smtp_host"),
-        "port": os.getenv("SMTP_PORT") or get_setting("smtp_port", "587"),
-        "username": os.getenv("SMTP_USERNAME") or get_setting("smtp_username"),
-        "password": os.getenv("SMTP_PASSWORD") or get_setting("smtp_password"),
-        "from_email": os.getenv("SMTP_FROM_EMAIL") or get_setting("smtp_from_email"),
-    }
-
-
-def ensure_default_categories(user_id: int) -> None:
-    now = datetime.now().isoformat()
-    with closing(get_connection()) as connection:
-        for transaction_type, categories in DEFAULT_CATEGORIES.items():
-            for name in categories:
-                normalized = normalize_category(name)
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO categories
-                    (user_id, transaction_type, name, is_default, created_at)
-                    VALUES (?, ?, ?, 1, ?)
-                    """,
-                    (user_id, transaction_type, normalized, now),
-                )
-        connection.commit()
-
-
-def get_categories_for_user(user_id: int) -> dict[str, list[str]]:
-    ensure_default_categories(user_id)
-    with closing(get_connection()) as connection:
-        rows = connection.execute(
-            """
-            SELECT transaction_type, name
-            FROM categories
-            WHERE user_id = ?
-            ORDER BY is_default DESC, name ASC
-            """,
-            (user_id,),
-        ).fetchall()
-
-    categories = {transaction_type: [] for transaction_type in TYPE_LABELS}
-    for row in rows:
-        categories[row["transaction_type"]].append(row["name"])
-    return categories
-
-
-def add_category_for_user(
-    user_id: int, transaction_type: str, category_name: str, is_default: bool = False
-) -> str:
-    normalized = normalize_category(category_name)
-    if not normalized or transaction_type not in TYPE_LABELS:
-        return normalized
-
-    with closing(get_connection()) as connection:
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO categories
-            (user_id, transaction_type, name, is_default, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                transaction_type,
-                normalized,
-                1 if is_default else 0,
-                datetime.now().isoformat(),
-            ),
-        )
-        connection.commit()
-    return normalized
-
-
-def create_user(full_name: str, username: str, email: str, password: str) -> tuple[bool, str]:
-    username = username.strip().lower()
-    full_name = full_name.strip()
-    email = email.strip().lower()
-
-    if not full_name or not username or not email or not password:
-        return False, "Please fill in all required fields."
-    if "@" not in email:
-        return False, "Please enter a valid email address."
-
-    now = datetime.now().isoformat()
-    try:
-        with closing(get_connection()) as connection:
-            connection.execute(
-                """
-                INSERT INTO users (username, full_name, email, password_hash, role, is_active, created_at)
-                VALUES (?, ?, ?, ?, 'user', 1, ?)
-                """,
-                (username, full_name, email, hash_password(password), now),
-            )
-            connection.commit()
-    except sqlite3.IntegrityError:
-        return False, "Username or email already exists."
-
-    user = get_user_by_username(username)
-    if user:
-        ensure_default_categories(user["id"])
-        send_account_creation_notifications(user)
-    return True, "Account created successfully. You can log in now."
-
-
-def authenticate_user(username: str, password: str) -> tuple[bool, dict[str, Any] | None, str]:
-    user = get_user_by_username(username.strip())
-    if not user:
-        return False, None, "User not found."
-    if not user["is_active"]:
-        return False, None, "This account has been disabled."
-    if not verify_password(password, user["password_hash"]):
-        return False, None, "Incorrect password."
-
-    with closing(get_connection()) as connection:
-        connection.execute(
-            "UPDATE users SET last_login_at = ? WHERE id = ?",
-            (datetime.now().isoformat(), user["id"]),
-        )
-        connection.commit()
-
-    return True, get_user_by_id(user["id"]), "Login successful."
-
-
-def update_user_role(user_id: int, role: str) -> None:
-    with closing(get_connection()) as connection:
-        connection.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
-        connection.commit()
-
-
-def update_user_status(user_id: int, is_active: bool) -> None:
-    with closing(get_connection()) as connection:
-        connection.execute(
-            "UPDATE users SET is_active = ? WHERE id = ?",
-            (1 if is_active else 0, user_id),
-        )
-        connection.commit()
-
-
-def reset_user_password(user_id: int, new_password: str) -> None:
-    with closing(get_connection()) as connection:
-        connection.execute(
-            "UPDATE users SET password_hash = ? WHERE id = ?",
-            (hash_password(new_password), user_id),
-        )
-        connection.commit()
-
-
-def delete_user_account(user_id: int) -> None:
-    with closing(get_connection()) as connection:
-        connection.execute("DELETE FROM transactions WHERE user_id = ?", (user_id,))
-        connection.execute("DELETE FROM categories WHERE user_id = ?", (user_id,))
-        connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
-        connection.commit()
-
-
-def reset_user_account_data(user_id: int) -> None:
-    with closing(get_connection()) as connection:
-        connection.execute("DELETE FROM transactions WHERE user_id = ?", (user_id,))
-        connection.execute(
-            "DELETE FROM categories WHERE user_id = ? AND is_default = 0",
-            (user_id,),
-        )
-        connection.commit()
-    ensure_default_categories(user_id)
-
-
-def delete_transaction(transaction_id: int, user_id: int) -> None:
-    with closing(get_connection()) as connection:
-        connection.execute(
-            "DELETE FROM transactions WHERE id = ? AND user_id = ?",
-            (transaction_id, user_id),
-        )
-        connection.commit()
-
-
-def delete_transactions(transaction_ids: list[int], user_id: int) -> None:
-    with closing(get_connection()) as connection:
-        connection.executemany(
-            "DELETE FROM transactions WHERE id = ? AND user_id = ?",
-            [(transaction_id, user_id) for transaction_id in transaction_ids],
-        )
-        connection.commit()
-
-
-def add_transaction(
-    user_id: int,
-    transaction_date: date,
-    transaction_type: str,
-    category: str,
-    amount: float,
-    notes: str,
-) -> None:
-    with closing(get_connection()) as connection:
-        connection.execute(
-            """
-            INSERT INTO transactions
-            (user_id, transaction_date, transaction_type, category, amount, notes, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                pd.Timestamp(transaction_date).strftime("%Y-%m-%d"),
-                transaction_type,
-                normalize_category(category),
-                round(float(amount), 2),
-                notes.strip(),
-                datetime.now().isoformat(),
-            ),
-        )
-        connection.commit()
-
-
-def get_transactions_for_user(user_id: int) -> pd.DataFrame:
-    with closing(get_connection()) as connection:
-        rows = connection.execute(
-            """
-            SELECT id, user_id, transaction_date, transaction_type, category, amount, notes, created_at
-            FROM transactions
-            WHERE user_id = ?
-            ORDER BY transaction_date DESC, id DESC
-            """,
-            (user_id,),
-        ).fetchall()
-
-    transactions = pd.DataFrame([dict(row) for row in rows])
-    if transactions.empty:
-        return pd.DataFrame(
-            columns=[
-                "id",
-                "user_id",
-                "transaction_date",
-                "transaction_type",
-                "category",
-                "amount",
-                "notes",
-                "created_at",
-            ]
-        )
-
-    transactions["transaction_date"] = pd.to_datetime(
-        transactions["transaction_date"], errors="coerce"
-    )
-    transactions["amount"] = pd.to_numeric(transactions["amount"], errors="coerce").fillna(0)
-    transactions["transaction_type"] = (
-        transactions["transaction_type"].astype(str).str.strip().str.lower()
-    )
-    transactions["category"] = transactions["category"].fillna("").astype(str)
-    transactions["notes"] = transactions["notes"].fillna("").astype(str)
-    return transactions.dropna(subset=["transaction_date"]).reset_index(drop=True)
-
-
-def format_currency(value: float) -> str:
-    return f"Rs. {value:,.2f}"
-
-
-def format_transaction_amount(amount: float, transaction_type: str) -> str:
-    prefix = "-" if transaction_type == "expense" else "+"
-    return f"{prefix} {format_currency(amount)}"
-
-
-def get_top_expense_category(transactions: pd.DataFrame) -> tuple[str, float]:
-    expense_data = transactions[transactions["transaction_type"] == "expense"]
-    if expense_data.empty:
-        return "No expenses yet", 0.0
-
-    category_totals = expense_data.groupby("category")["amount"].sum().sort_values(ascending=False)
-    top_category = category_totals.index[0]
-    return str(top_category), float(category_totals.iloc[0])
-
-
-def get_largest_transaction(transactions: pd.DataFrame) -> dict[str, Any] | None:
-    if transactions.empty:
+    if row is None:
         return None
-    row = transactions.sort_values("amount", ascending=False).iloc[0]
-    return row.to_dict()
+    return json.loads(row[0])
 
 
-def get_date_defaults(transactions: pd.DataFrame) -> tuple[date, date]:
-    if not transactions.empty:
-        return transactions["transaction_date"].min().date(), transactions["transaction_date"].max().date()
-    today = pd.Timestamp.today().date()
-    return today, today
+def delete_state(state_key: str):
+    init_database()
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("DELETE FROM app_state WHERE state_key = ?", (state_key,))
+        conn.commit()
 
 
-def set_active_section(section: str, admin_section: str | None = None) -> None:
-    st.session_state[DASHBOARD_SECTION_KEY] = section
-    if admin_section is not None:
-        st.session_state[ADMIN_SECTION_KEY] = admin_section
+def migrate_legacy_json_if_needed(state_key: str, legacy_file: Path):
+    if load_state(state_key) is not None or not legacy_file.exists():
+        return
+    try:
+        payload = json.loads(legacy_file.read_text())
+        save_state(state_key, payload)
+    except Exception:
+        pass
 
 
-def render_section_navigation(options: list[str], key: str) -> str:
-    if st.session_state.get(key) not in options:
-        st.session_state[key] = options[0]
+@dataclass
+class Member:
+    name: str
+    dept: str
+    file_id: str
+    phone_number: str = ""
+    afternoon_only: bool = False
 
-    selected = st.segmented_control(
-        "Section",
-        options,
-        default=st.session_state[key],
-        key=key,
-        width="stretch",
-        label_visibility="collapsed",
-    )
-    if selected not in options:
-        selected = options[0]
-        st.session_state[key] = selected
-    return str(selected)
+    @property
+    def weekend_off_if_afternoon_only(self) -> bool:
+        return self.afternoon_only
 
 
-def build_transactions_csv(transactions: pd.DataFrame) -> bytes:
-    export_df = transactions.copy()
-    if export_df.empty:
-        export_df = pd.DataFrame(columns=["date", "type", "category", "amount", "notes"])
-    else:
-        export_df = export_df.rename(
-            columns={
-                "transaction_date": "date",
-                "transaction_type": "type",
-            }
-        )[["date", "type", "category", "amount", "notes"]]
-        export_df["date"] = pd.to_datetime(export_df["date"]).dt.strftime("%Y-%m-%d")
-    return export_df.to_csv(index=False).encode("utf-8")
+def month_key(dt: date) -> Tuple[int, int]:
+    return dt.year, dt.month
 
 
-def build_transaction_template_csv() -> bytes:
-    template_df = pd.DataFrame(
+def dates_in_range(start_date: date, end_date: date) -> List[date]:
+    return [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+
+
+def month_segment_days(start_date: date, end_date: date) -> Dict[Tuple[int, int], List[date]]:
+    grouped: Dict[Tuple[int, int], List[date]] = {}
+    for dt in dates_in_range(start_date, end_date):
+        grouped.setdefault(month_key(dt), []).append(dt)
+    return grouped
+
+
+def prorated_target(global_weekoffs_per_month: int, start_date: date, end_date: date) -> Dict[Tuple[int, int], int]:
+    targets: Dict[Tuple[int, int], int] = {}
+    for mk, days in month_segment_days(start_date, end_date).items():
+        year, month = mk
+        days_in_month = calendar.monthrange(year, month)[1]
+        targets[mk] = round(global_weekoffs_per_month * len(days) / days_in_month)
+    return targets
+
+
+def ensure_date_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    df = df.copy()
+    for col in cols:
+        if col not in df.columns:
+            df[col] = pd.NaT
+        df[col] = pd.to_datetime(df[col], errors="coerce")
+    return df
+
+
+def sample_team_df() -> pd.DataFrame:
+    return pd.DataFrame(
         [
-            {
-                "date": "2026-04-01",
-                "type": "expense",
-                "category": "Food",
-                "amount": 250.00,
-                "notes": "Lunch",
-            },
-            {
-                "date": "2026-04-01",
-                "type": "credit",
-                "category": "Salary Credit",
-                "amount": 50000.00,
-                "notes": "Monthly salary",
-            },
+            {"name": "Aarav", "dept": "Ops", "file_id": "F001", "phone_number": "9000000001", "afternoon_only": "No"},
+            {"name": "Bhavna", "dept": "Ops", "file_id": "F002", "phone_number": "9000000002", "afternoon_only": "No"},
+            {"name": "Charan", "dept": "Support", "file_id": "F003", "phone_number": "9000000003", "afternoon_only": "Yes"},
+            {"name": "Divya", "dept": "Support", "file_id": "F004", "phone_number": "9000000004", "afternoon_only": "No"},
+            {"name": "Eshan", "dept": "Ops", "file_id": "F005", "phone_number": "9000000005", "afternoon_only": "No"},
+            {"name": "Farah", "dept": "Ops", "file_id": "F006", "phone_number": "9000000006", "afternoon_only": "No"},
+            {"name": "Gautham", "dept": "Support", "file_id": "F007", "phone_number": "9000000007", "afternoon_only": "No"},
+            {"name": "Harini", "dept": "Support", "file_id": "F008", "phone_number": "9000000008", "afternoon_only": "No"},
         ]
     )
-    return template_df.to_csv(index=False).encode("utf-8")
 
 
-def import_transactions_csv(user_id: int, uploaded_file) -> tuple[bool, str]:
+def normalize_team_import_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return sample_team_df().iloc[0:0].copy()
+
+    normalized_columns = {str(col).strip().lower(): col for col in df.columns}
+    column_aliases = {
+        "name": "name",
+        "member_name": "name",
+        "employee_name": "name",
+        "dept": "dept",
+        "department": "dept",
+        "file_id": "file_id",
+        "file id": "file_id",
+        "employee_id": "file_id",
+        "phone_number": "phone_number",
+        "phone number": "phone_number",
+        "phone": "phone_number",
+        "mobile": "phone_number",
+        "mobile_number": "phone_number",
+        "mobile number": "phone_number",
+        "contact_number": "phone_number",
+        "contact number": "phone_number",
+        "afternoon_only": "afternoon_only",
+        "afternoon only": "afternoon_only",
+    }
+
+    mapped: Dict[str, str] = {}
+    for raw_name, original in normalized_columns.items():
+        target = column_aliases.get(raw_name)
+        if target and target not in mapped:
+            mapped[target] = original
+
+    if "name" not in mapped:
+        raise ValueError("Uploaded Excel must include a 'name' column.")
+
+    normalized_df = pd.DataFrame()
+    for target_col in ["name", "dept", "file_id", "phone_number", "afternoon_only"]:
+        source_col = mapped.get(target_col)
+        if source_col is None:
+            normalized_df[target_col] = ""
+        else:
+            normalized_df[target_col] = df[source_col]
+
+    normalized_df = normalized_df.fillna("")
+    normalized_df["name"] = normalized_df["name"].astype(str).str.strip()
+    normalized_df["dept"] = normalized_df["dept"].astype(str).str.strip()
+    normalized_df["file_id"] = normalized_df["file_id"].astype(str).str.strip()
+    normalized_df["phone_number"] = normalized_df["phone_number"].astype(str).str.strip()
+    normalized_df["afternoon_only"] = (
+        normalized_df["afternoon_only"]
+        .astype(str)
+        .str.strip()
+        .replace({"": "No", "nan": "No", "true": "Yes", "false": "No", "1": "Yes", "0": "No"})
+    )
+    normalized_df["afternoon_only"] = normalized_df["afternoon_only"].apply(
+        lambda value: "Yes" if str(value).strip().lower() in {"yes", "y", "true", "1"} else "No"
+    )
+    normalized_df = normalized_df[normalized_df["name"] != ""].reset_index(drop=True)
+    return normalized_df
+
+
+def sample_leaves_df() -> pd.DataFrame:
+    today = date.today()
+    df = pd.DataFrame(
+        [
+            {"name": "Bhavna", "leave_start_date": today + timedelta(days=4), "leave_end_date": today + timedelta(days=5)},
+            {"name": "Divya", "leave_start_date": today + timedelta(days=9), "leave_end_date": today + timedelta(days=10)},
+        ]
+    )
+    return ensure_date_columns(df, ["leave_start_date", "leave_end_date"])
+
+
+def sample_bank_holidays_df() -> pd.DataFrame:
+    df = pd.DataFrame([{"bank_holiday_date": pd.NaT}])
+    return ensure_date_columns(df, ["bank_holiday_date"])
+
+
+def sample_sync_groups_df() -> pd.DataFrame:
+    return pd.DataFrame([
+        {"sync_group": ""}
+    ])
+
+
+def load_inputs():
+    migrate_legacy_json_if_needed(STATE_KEY_INPUTS, DATA_FILE)
+    data = load_state(STATE_KEY_INPUTS)
+    if data is None:
+        return sample_team_df(), sample_leaves_df(), sample_bank_holidays_df(), sample_sync_groups_df()
+
     try:
-        uploaded_file.seek(0)
-        imported_df = pd.read_csv(uploaded_file)
-    except Exception as exc:
-        return False, f"Could not read CSV: {exc}"
+        team_df = pd.DataFrame(data.get("team", []))
+        if team_df.empty:
+            team_df = sample_team_df()
 
-    required_columns = {"date", "type", "category", "amount"}
-    missing_columns = required_columns - set(imported_df.columns)
-    if missing_columns:
-        missing = ", ".join(sorted(missing_columns))
-        return False, f"CSV is missing required columns: {missing}"
+        leaves_df = pd.DataFrame(data.get("leaves", []))
+        if leaves_df.empty:
+            leaves_df = sample_leaves_df()
+        leaves_df = ensure_date_columns(leaves_df, ["leave_start_date", "leave_end_date"])
 
-    if "notes" not in imported_df.columns:
-        imported_df["notes"] = ""
+        bank_df = pd.DataFrame(data.get("bank_holidays", []))
+        if bank_df.empty:
+            bank_df = sample_bank_holidays_df()
+        bank_df = ensure_date_columns(bank_df, ["bank_holiday_date"])
 
-    imported_df = imported_df.fillna("")
-    inserted = 0
-    skipped = 0
-    now = datetime.now().isoformat()
+        sync_df = pd.DataFrame(data.get("sync_groups", []))
+        if sync_df.empty:
+            sync_df = sample_sync_groups_df()
+        if "sync_group" not in sync_df.columns:
+            sync_df["sync_group"] = ""
+        return team_df, leaves_df, bank_df, sync_df
+    except Exception:
+        return sample_team_df(), sample_leaves_df(), sample_bank_holidays_df(), sample_sync_groups_df()
 
-    with closing(get_connection()) as connection:
-        category_rows: set[tuple[int, str, str, int, str]] = set()
-        for _, row in imported_df.iterrows():
-            transaction_date = pd.to_datetime(row.get("date"), errors="coerce")
-            transaction_type = str(row.get("type", "")).strip().lower()
-            category = normalize_category(str(row.get("category", "")).strip())
-            amount = pd.to_numeric(row.get("amount"), errors="coerce")
-            notes = str(row.get("notes", "")).strip()
 
-            if (
-                pd.isna(transaction_date)
-                or transaction_type not in TYPE_LABELS
-                or not category
-                or pd.isna(amount)
-                or float(amount) <= 0
-            ):
-                skipped += 1
+def serialize_dates_for_json(records: List[dict], date_cols: List[str]) -> List[dict]:
+    out = []
+    for row in records:
+        row = dict(row)
+        for c in date_cols:
+            v = row.get(c)
+            if pd.isna(v) or v in ("", None):
+                row[c] = None
+            else:
+                row[c] = pd.to_datetime(v).date().isoformat()
+        out.append(row)
+    return out
+
+
+def save_inputs(team_df: pd.DataFrame, leaves_df: pd.DataFrame, bank_df: pd.DataFrame, sync_df: pd.DataFrame):
+    payload = {
+        "team": team_df.fillna("").to_dict(orient="records"),
+        "leaves": serialize_dates_for_json(leaves_df.to_dict(orient="records"), ["leave_start_date", "leave_end_date"]),
+        "bank_holidays": serialize_dates_for_json(bank_df.to_dict(orient="records"), ["bank_holiday_date"]),
+        "sync_groups": sync_df.fillna("").to_dict(orient="records"),
+    }
+    save_state(STATE_KEY_INPUTS, payload)
+
+
+def save_generated_rota(matrix_df: pd.DataFrame, full_df: pd.DataFrame, daywise_df: pd.DataFrame,
+                        summary_df: pd.DataFrame, warnings_df: pd.DataFrame, bank_holidays: Set[date],
+                        start_date: date, end_date: date, excel_bytes: bytes):
+    payload = {
+        "metadata": {
+            "saved_at": datetime.utcnow().isoformat(timespec="seconds"),
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "bank_holidays": sorted([d.isoformat() for d in bank_holidays]),
+        },
+        "matrix_df": matrix_df.to_dict(orient="records"),
+        "full_df": full_df.to_dict(orient="records"),
+        "daywise_df": daywise_df.to_dict(orient="records"),
+        "summary_df": summary_df.to_dict(orient="records"),
+        "warnings_df": warnings_df.to_dict(orient="records"),
+    }
+    save_state(STATE_KEY_ROTA, payload)
+    ROTA_CSV_FILE.write_text(matrix_df.to_csv(index=False))
+    ROTA_EXCEL_FILE.write_bytes(excel_bytes)
+
+
+def load_saved_rota():
+    migrate_legacy_json_if_needed(STATE_KEY_ROTA, ROTA_FILE)
+    payload = load_state(STATE_KEY_ROTA)
+    if payload is None:
+        return None
+    try:
+        return {
+            "metadata": payload.get("metadata", {}),
+            "matrix_df": pd.DataFrame(payload.get("matrix_df", [])),
+            "full_df": pd.DataFrame(payload.get("full_df", [])),
+            "daywise_df": pd.DataFrame(payload.get("daywise_df", [])),
+            "summary_df": pd.DataFrame(payload.get("summary_df", [])),
+            "warnings_df": pd.DataFrame(payload.get("warnings_df", [])),
+            "bank_holidays": {datetime.strptime(d, "%Y-%m-%d").date() for d in payload.get("metadata", {}).get("bank_holidays", [])},
+        }
+    except Exception:
+        return None
+
+
+def parse_members(df: pd.DataFrame) -> List[Member]:
+    colmap = {c.lower(): c for c in df.columns}
+    required = {"name", "dept", "file_id", "afternoon_only"}
+    if not required.issubset(colmap):
+        raise ValueError("Team sheet must contain columns: name, dept, file_id, afternoon_only")
+
+    members: List[Member] = []
+    seen: Set[str] = set()
+    for _, row in df.iterrows():
+        name = str(row[colmap["name"]]).strip()
+        if not name or name.lower() == "nan":
+            continue
+        if name.lower() in seen:
+            raise ValueError(f"Duplicate member found: {name}")
+        seen.add(name.lower())
+
+        dept = str(row[colmap["dept"]]).strip()
+        if dept.lower() == "nan":
+            dept = ""
+
+        file_id = str(row[colmap["file_id"]]).strip()
+        if file_id.lower() == "nan":
+            file_id = ""
+
+        phone_column = colmap.get("phone_number")
+        phone_number = str(row[phone_column]).strip() if phone_column else ""
+        if phone_number.lower() == "nan":
+            phone_number = ""
+
+        afternoon_only = str(row[colmap["afternoon_only"]]).strip().lower() in {"yes", "y", "true", "1"}
+        members.append(Member(name=name, dept=dept, file_id=file_id, phone_number=phone_number, afternoon_only=afternoon_only))
+
+    if not members:
+        raise ValueError("Please add at least one team member.")
+    return members
+
+
+def parse_leaves(df: pd.DataFrame, valid_names: Set[str]) -> Dict[str, Set[date]]:
+    if df.empty:
+        return {}
+
+    colmap = {c.lower(): c for c in df.columns}
+    required = {"name", "leave_start_date", "leave_end_date"}
+    if not required.issubset(colmap):
+        raise ValueError("Leaves sheet must contain columns: name, leave_start_date, leave_end_date")
+
+    leave_map: Dict[str, Set[date]] = {}
+    for _, row in df.iterrows():
+        raw_name = row[colmap["name"]]
+        if pd.isna(raw_name):
+            continue
+        name = str(raw_name).strip()
+        if not name or name.lower() in {"nan", "nat", "none"}:
+            continue
+        if name not in valid_names:
+            raise ValueError(f"Leave entered for unknown member: {name}")
+
+        start_value = row[colmap["leave_start_date"]]
+        end_value = row[colmap["leave_end_date"]]
+        if pd.isna(start_value) or pd.isna(end_value):
+            continue
+
+        start_dt = pd.to_datetime(start_value).date()
+        end_dt = pd.to_datetime(end_value).date()
+        if end_dt < start_dt:
+            raise ValueError(f"Leave end date cannot be before start date for {name}.")
+
+        current = start_dt
+        while current <= end_dt:
+            leave_map.setdefault(name, set()).add(current)
+            current += timedelta(days=1)
+    return leave_map
+
+
+def parse_specific_bank_holidays(df: pd.DataFrame) -> Set[date]:
+    if df.empty:
+        return set()
+    if "bank_holiday_date" not in df.columns:
+        raise ValueError("Bank holiday sheet must contain column: bank_holiday_date")
+
+    holiday_dates: Set[date] = set()
+    for _, row in df.iterrows():
+        value = row["bank_holiday_date"]
+        if pd.isna(value):
+            continue
+        holiday_dates.add(pd.to_datetime(value).date())
+    return holiday_dates
+
+
+def resolve_selected_bank_holidays(
+    start_date: date,
+    end_date: date,
+    bank_holiday_mode: str,
+    auto_bank_holiday_days: int,
+    specific_bank_holiday_df: pd.DataFrame,
+) -> Set[date]:
+    auto_holidays = generate_auto_bank_holidays(start_date, end_date, int(auto_bank_holiday_days)) if bank_holiday_mode in {"By number of days", "Both"} else set()
+    specific_holidays = parse_specific_bank_holidays(specific_bank_holiday_df) if bank_holiday_mode in {"By specific dates", "Both"} else set()
+    return auto_holidays | specific_holidays
+
+
+def parse_sync_groups(df: pd.DataFrame, valid_names: Set[str]) -> Dict[str, List[str]]:
+    if df.empty:
+        return {}
+    if "sync_group" not in df.columns:
+        raise ValueError("Sync groups sheet must contain column: sync_group")
+
+    primary_to_followers: Dict[str, List[str]] = {}
+    follower_to_primary: Dict[str, str] = {}
+
+    for _, row in df.iterrows():
+        raw = str(row.get("sync_group", "")).strip()
+        if not raw or raw.lower() == "nan":
+            continue
+        members = [name.strip() for name in raw.split(",") if name.strip()]
+        # de-duplicate while preserving order
+        seen = set()
+        members = [m for m in members if not (m.lower() in seen or seen.add(m.lower()))]
+        if len(members) < 2:
+            continue
+        for name in members:
+            if name not in valid_names:
+                raise ValueError(f"Sync group contains unknown member: {name}")
+        primary = members[0]
+        followers = members[1:]
+        primary_to_followers.setdefault(primary, [])
+        for follower in followers:
+            existing_primary = follower_to_primary.get(follower)
+            if existing_primary and existing_primary != primary:
+                raise ValueError(f"{follower} cannot be synced to more than one primary member.")
+            if follower == primary:
+                continue
+            follower_to_primary[follower] = primary
+            if follower not in primary_to_followers[primary]:
+                primary_to_followers[primary].append(follower)
+    return primary_to_followers
+
+
+def generate_auto_bank_holidays(start_date: date, end_date: date, count_per_month: int) -> Set[date]:
+    holidays: Set[date] = set()
+    if count_per_month <= 0:
+        return holidays
+
+    for _, days in month_segment_days(start_date, end_date).items():
+        weekdays = [d for d in days if d.weekday() < 5]
+        preferred = sorted(weekdays, key=lambda d: (abs(d.day - 15), d.day))
+        holidays.update(preferred[: min(count_per_month, len(preferred))])
+    return holidays
+
+
+def is_working_shift(shift: str) -> bool:
+    return shift in {SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT}
+
+
+def apply_night_block_offs(schedule: Dict[str, Dict[date, str]], member: str, dates: List[date], start_index: int, block_len: int):
+    for j in range(start_index + block_len, min(start_index + block_len + MANDATORY_OFF_AFTER_NIGHT, len(dates))):
+        dt = dates[j]
+        if schedule[member].get(dt, SHIFT_UNASSIGNED) == SHIFT_UNASSIGNED:
+            schedule[member][dt] = SHIFT_WEEKOFF
+
+
+def compute_stats_before_day(schedule: Dict[str, Dict[date, str]], dates: List[date], day_index: int, member: str):
+    prev_day = dates[day_index - 1] if day_index > 0 else None
+    prev_shift = schedule[member].get(prev_day) if prev_day else None
+
+    continuous_work = 0
+    idx = day_index - 1
+    while idx >= 0 and is_working_shift(schedule[member].get(dates[idx], SHIFT_UNASSIGNED)):
+        continuous_work += 1
+        idx -= 1
+
+    continuous_night = 0
+    idx = day_index - 1
+    while idx >= 0 and schedule[member].get(dates[idx]) == SHIFT_NIGHT:
+        continuous_night += 1
+        idx -= 1
+
+    month = month_key(dates[day_index])
+    month_wo = sum(1 for d in dates[:day_index] if month_key(d) == month and schedule[member].get(d) == SHIFT_WEEKOFF)
+    month_night_blocks = 0
+    for idx, d in enumerate(dates[:day_index]):
+        if month_key(d) != month or schedule[member].get(d) != SHIFT_NIGHT:
+            continue
+        prev_same_month_is_night = idx > 0 and month_key(dates[idx - 1]) == month and schedule[member].get(dates[idx - 1]) == SHIFT_NIGHT
+        if not prev_same_month_is_night:
+            month_night_blocks += 1
+
+    return {
+        "prev_shift": prev_shift,
+        "continuous_work": continuous_work,
+        "continuous_night": continuous_night,
+        "month_wo": month_wo,
+        "month_night_blocks": month_night_blocks,
+    }
+
+
+def choose_weekoff_candidate(candidates: List[str], stats_map: Dict[str, dict], target_wo: int, month_wo_count: Dict[str, int]) -> str | None:
+    if not candidates:
+        return None
+    ranked = sorted(
+        candidates,
+        key=lambda n: (
+            month_wo_count[n] >= target_wo,
+            month_wo_count[n],
+            -stats_map[n]["continuous_work"],
+            n.lower(),
+        ),
+    )
+    return ranked[0]
+
+
+def choose_shift_candidates(
+    candidates: List[str],
+    shift: str,
+    needed: int,
+    stats_map: Dict[str, dict],
+    shift_counts: Dict[str, Dict[str, int]],
+) -> List[str]:
+    def score(name: str):
+        s = stats_map[name]
+        continuity_bonus = -100 if s["prev_shift"] == shift else 0
+        night_limit_penalty = 10_000 if shift == SHIFT_NIGHT and s["continuous_night"] >= MAX_CONTINUOUS_NIGHT else 0
+        night_block_penalty = 20_000 if shift == SHIFT_NIGHT and s["prev_shift"] != SHIFT_NIGHT and s["month_night_blocks"] >= 1 else 0
+        total_assigned = shift_counts[SHIFT_MORNING][name] + shift_counts[SHIFT_AFTERNOON][name] + shift_counts[SHIFT_NIGHT][name]
+        night_streak_priority = -s["continuous_night"] if shift == SHIFT_NIGHT else 0
+        return (
+            night_block_penalty,
+            night_limit_penalty,
+            night_streak_priority,
+            continuity_bonus,
+            shift_counts[shift][name],
+            s["continuous_work"],
+            total_assigned,
+            name.lower(),
+        )
+
+    eligible = []
+    relaxed_eligible = []
+    for name in candidates:
+        s = stats_map[name]
+        if s["continuous_work"] >= MAX_CONTINUOUS_WORKING_DAYS:
+            continue
+        if shift == SHIFT_NIGHT and s["continuous_night"] >= MAX_CONTINUOUS_NIGHT:
+            continue
+        if shift == SHIFT_NIGHT and s["prev_shift"] != SHIFT_NIGHT and s["month_night_blocks"] >= 1:
+            relaxed_eligible.append(name)
+            continue
+        eligible.append(name)
+
+    if shift == SHIFT_NIGHT:
+        continuing_night = [name for name in eligible if stats_map[name]["prev_shift"] == SHIFT_NIGHT]
+        if len(continuing_night) >= needed:
+            return sorted(continuing_night, key=score)[:needed]
+        if continuing_night:
+            remaining = [name for name in eligible if name not in continuing_night]
+            ordered = sorted(continuing_night, key=score) + sorted(remaining, key=score) + sorted(relaxed_eligible, key=score)
+            return ordered[:needed]
+        if len(eligible) < needed and relaxed_eligible:
+            eligible = eligible + sorted(relaxed_eligible, key=score)
+
+    return sorted(eligible, key=score)[:needed]
+
+
+def planned_weekoffs_for_day(
+    dt: date,
+    dates: List[date],
+    day_index: int,
+    member_names: List[str],
+    month_wo_count: Dict[str, int],
+    target_wo: int,
+    max_allowed: int,
+) -> int:
+    if max_allowed <= 0:
+        return 0
+    month_days = [month_dt for month_dt in dates if month_key(month_dt) == month_key(dt)]
+    if not month_days:
+        return 0
+    days_elapsed_in_month = sum(1 for month_dt in month_days if month_dt <= dt)
+    target_total_for_month = target_wo * len(member_names)
+    desired_cumulative_total = round(target_total_for_month * days_elapsed_in_month / len(month_days))
+    current_total = sum(month_wo_count.values())
+    desired_today = desired_cumulative_total - current_total
+    return max(0, min(max_allowed, desired_today))
+
+
+def is_restricted_staffing_day(dt: date, bank_holidays: Set[date]) -> bool:
+    return dt.weekday() >= 5 or dt in bank_holidays
+
+
+def preferred_night_block_length(remaining_days: int) -> int:
+    if remaining_days <= 0:
+        return 0
+    if remaining_days == 1:
+        return 1
+    block_count = (remaining_days + MAX_CONTINUOUS_NIGHT - 1) // MAX_CONTINUOUS_NIGHT
+    base, extra = divmod(remaining_days, block_count)
+    return base + (1 if extra else 0)
+
+
+def build_night_block_lengths(total_days: int, block_count: int) -> List[int]:
+    if total_days <= 0 or block_count <= 0 or block_count > total_days:
+        return []
+    if block_count * MAX_CONTINUOUS_NIGHT < total_days:
+        return []
+    base, extra = divmod(total_days, block_count)
+    lengths = [base + (1 if idx < extra else 0) for idx in range(block_count)]
+    if any(length <= 0 or length > MAX_CONTINUOUS_NIGHT for length in lengths):
+        return []
+    return lengths
+
+
+def plan_night_lane_block_lengths(total_days: int, eligible_member_count: int) -> Tuple[List[List[int]], bool]:
+    if total_days <= 0:
+        return [[] for _ in range(MIN_NIGHT)], False
+
+    min_blocks_per_lane = (total_days + MAX_CONTINUOUS_NIGHT - 1) // MAX_CONTINUOUS_NIGHT
+    lane_block_counts = [min_blocks_per_lane for _ in range(MIN_NIGHT)]
+    base_total_blocks = sum(lane_block_counts)
+    total_night_slots = total_days * MIN_NIGHT
+    target_total_blocks = min(max(eligible_member_count, base_total_blocks), total_night_slots)
+    everyone_can_get_night_block = eligible_member_count <= total_night_slots
+
+    extra_blocks = max(0, target_total_blocks - base_total_blocks)
+    lane_index = 0
+    while extra_blocks > 0:
+        if lane_block_counts[lane_index] < total_days:
+            lane_block_counts[lane_index] += 1
+            extra_blocks -= 1
+        lane_index = (lane_index + 1) % MIN_NIGHT
+
+    lane_lengths = [build_night_block_lengths(total_days, count) for count in lane_block_counts]
+    return lane_lengths, everyone_can_get_night_block
+
+
+def pick_night_block_owner(
+    candidates: List[str],
+    block_dates: List[date],
+    off_dates: List[date],
+    previous_dt: date | None,
+    reservations: Dict[str, Dict[date, str]],
+    member_map: Dict[str, Member],
+    sync_groups: Dict[str, List[str]],
+    month: Tuple[int, int],
+    month_block_count: Dict[str, Dict[Tuple[int, int], int]],
+    night_day_count: Dict[str, int],
+) -> str | None:
+    eligible: List[str] = []
+    for name in candidates:
+        if member_map[name].afternoon_only:
+            continue
+        if previous_dt and reservations[name].get(previous_dt) == SHIFT_NIGHT:
+            continue
+        if any(reservations[name].get(dt, SHIFT_UNASSIGNED) != SHIFT_UNASSIGNED for dt in block_dates):
+            continue
+        if any(reservations[name].get(dt, SHIFT_UNASSIGNED) == SHIFT_NIGHT for dt in off_dates):
+            continue
+        eligible.append(name)
+
+    if not eligible:
+        return None
+
+    unused_this_month = [name for name in eligible if month_block_count[name].get(month, 0) == 0]
+    pool = unused_this_month or eligible
+    ranked = sorted(
+        pool,
+        key=lambda name: (
+            month_block_count[name].get(month, 0),
+            len(sync_groups.get(name, [])),
+            night_day_count[name],
+            name.lower(),
+        ),
+    )
+    return ranked[0] if ranked else None
+
+
+def plan_night_shift_blocks(
+    members: List[Member],
+    leaves: Dict[str, Set[date]],
+    dates: List[date],
+    sync_groups: Dict[str, List[str]],
+    bank_holidays: Set[date],
+) -> Tuple[Dict[date, List[str]], Dict[str, Dict[date, str]], List[dict]]:
+    member_names = [m.name for m in members]
+    member_map = {m.name: m for m in members}
+    follower_to_primary = {follower: primary for primary, followers in sync_groups.items() for follower in followers}
+    reservations: Dict[str, Dict[date, str]] = {
+        name: {dt: SHIFT_UNASSIGNED for dt in dates}
+        for name in member_names
+    }
+    planned_night_primaries: Dict[date, List[str]] = {dt: [] for dt in dates}
+    month_block_count: Dict[str, Dict[Tuple[int, int], int]] = {name: {} for name in member_names}
+    night_day_count = {name: 0 for name in member_names}
+    warnings: List[dict] = []
+    date_index = {dt: idx for idx, dt in enumerate(dates)}
+    month_dates_map: Dict[Tuple[int, int], List[date]] = {}
+
+    for name, leave_dates in leaves.items():
+        for dt in leave_dates:
+            if name in reservations and dt in reservations[name]:
+                reservations[name][dt] = SHIFT_LEAVE
+
+    for dt in dates:
+        month_dates_map.setdefault(month_key(dt), []).append(dt)
+
+    primary_candidates = [name for name in member_names if not member_map[name].afternoon_only and name not in follower_to_primary]
+    fallback_candidates = [name for name in member_names if not member_map[name].afternoon_only]
+
+    for month, month_dates in sorted(month_dates_map.items()):
+        eligible_for_night = [
+            name for name in member_names
+            if not member_map[name].afternoon_only
+        ]
+        lane_block_lengths, everyone_can_get_night_block = plan_night_lane_block_lengths(len(month_dates), len(eligible_for_night))
+
+        if not everyone_can_get_night_block and eligible_for_night:
+            warnings.append({
+                "date": month_dates[0].isoformat(),
+                "warning": (
+                    "Night demand exceeds the standard 2-resource Night capacity for this month. "
+                    "The planner may use a 3rd Night resource on non-restricted days so more eligible members still receive a Night block."
+                ),
+            })
+
+        for lane_lengths in lane_block_lengths:
+            month_pos = 0
+            for planned_len in lane_lengths:
+                chosen_name = None
+                chosen_len = 0
+                start_dt = month_dates[month_pos]
+                global_start_index = date_index[start_dt]
+                previous_dt = dates[global_start_index - 1] if global_start_index > 0 else None
+                candidate_lengths = [planned_len]
+                if planned_len > 1:
+                    candidate_lengths.extend(range(planned_len - 1, 0, -1))
+
+                for block_len in candidate_lengths:
+                    block_dates = month_dates[month_pos: month_pos + block_len]
+                    if len(block_dates) != block_len:
+                        continue
+                    global_end_index = date_index[block_dates[-1]]
+                    off_dates = dates[global_end_index + 1: min(global_end_index + 1 + MANDATORY_OFF_AFTER_NIGHT, len(dates))]
+
+                    for candidate_pool in (primary_candidates, fallback_candidates):
+                        chosen_name = pick_night_block_owner(
+                            candidates=candidate_pool,
+                            block_dates=block_dates,
+                            off_dates=off_dates,
+                            previous_dt=previous_dt,
+                            reservations=reservations,
+                            member_map=member_map,
+                            sync_groups=sync_groups,
+                            month=month,
+                            month_block_count=month_block_count,
+                            night_day_count=night_day_count,
+                        )
+                        if chosen_name:
+                            chosen_len = block_len
+                            break
+                    if chosen_name:
+                        break
+
+                if chosen_name is None:
+                    warnings.append({
+                        "date": start_dt.isoformat(),
+                        "warning": "Night planner could not pre-assign a continuous block. Fallback day-level night allocation will be used.",
+                    })
+                    month_pos += max(1, planned_len)
+                    continue
+
+                if chosen_len == 1:
+                    warnings.append({
+                        "date": start_dt.isoformat(),
+                        "warning": f"Night planner assigned a 1-day night block to {chosen_name} because no longer continuous block was available.",
+                    })
+
+                block_dates = month_dates[month_pos: month_pos + chosen_len]
+                global_end_index = date_index[block_dates[-1]]
+                off_dates = dates[global_end_index + 1: min(global_end_index + 1 + MANDATORY_OFF_AFTER_NIGHT, len(dates))]
+
+                if previous_dt and reservations[chosen_name].get(previous_dt) == SHIFT_UNASSIGNED:
+                    reservations[chosen_name][previous_dt] = SHIFT_WEEKOFF
+
+                for dt in block_dates:
+                    reservations[chosen_name][dt] = SHIFT_NIGHT
+                    planned_night_primaries[dt].append(chosen_name)
+
+                for dt in off_dates:
+                    if reservations[chosen_name].get(dt) == SHIFT_UNASSIGNED:
+                        reservations[chosen_name][dt] = SHIFT_WEEKOFF
+
+                month_block_count[chosen_name][month] = month_block_count[chosen_name].get(month, 0) + 1
+                night_day_count[chosen_name] += chosen_len
+                month_pos += chosen_len
+
+        missing_night_members = [
+            name for name in eligible_for_night
+            if month_block_count[name].get(month, 0) == 0
+        ]
+        if missing_night_members:
+            extra_night_dates = sorted(
+                [dt for dt in month_dates if not is_restricted_staffing_day(dt, bank_holidays)],
+                reverse=True,
+            )
+            for missing_name in missing_night_members:
+                assigned_extra_night = False
+                for extra_dt in extra_night_dates:
+                    if len(planned_night_primaries[extra_dt]) >= 3:
+                        continue
+
+                    global_start_index = date_index[extra_dt]
+                    previous_dt = dates[global_start_index - 1] if global_start_index > 0 else None
+                    off_dates = dates[
+                        global_start_index + 1: min(global_start_index + 1 + MANDATORY_OFF_AFTER_NIGHT, len(dates))
+                    ]
+                    chosen_name = pick_night_block_owner(
+                        candidates=[missing_name],
+                        block_dates=[extra_dt],
+                        off_dates=off_dates,
+                        previous_dt=previous_dt,
+                        reservations=reservations,
+                        member_map=member_map,
+                        sync_groups=sync_groups,
+                        month=month,
+                        month_block_count=month_block_count,
+                        night_day_count=night_day_count,
+                    )
+                    if not chosen_name:
+                        continue
+
+                    reservations[chosen_name][extra_dt] = SHIFT_NIGHT
+                    planned_night_primaries[extra_dt].append(chosen_name)
+                    for off_dt in off_dates:
+                        if reservations[chosen_name].get(off_dt) == SHIFT_UNASSIGNED:
+                            reservations[chosen_name][off_dt] = SHIFT_WEEKOFF
+
+                    month_block_count[chosen_name][month] = month_block_count[chosen_name].get(month, 0) + 1
+                    night_day_count[chosen_name] += 1
+                    warnings.append({
+                        "date": extra_dt.isoformat(),
+                        "warning": f"Assigned a 3rd Night resource for {chosen_name} to keep Night allocation fair without breaking weekend or bank-holiday staffing rules.",
+                    })
+                    assigned_extra_night = True
+                    break
+
+                if not assigned_extra_night:
+                    warnings.append({
+                        "date": month_dates[0].isoformat(),
+                        "warning": f"Could not assign any Night block to {missing_name} without breaking the existing rota rules.",
+                    })
+
+    return planned_night_primaries, reservations, warnings
+
+
+def repair_single_night_blocks(schedule: Dict[str, Dict[date, str]], member_names: List[str], dates: List[date]):
+    for idx in range(len(dates) - 1):
+        dt = dates[idx]
+        next_dt = dates[idx + 1]
+        prev_dt = dates[idx - 1] if idx > 0 else None
+
+        for name in member_names:
+            if schedule[name][dt] != SHIFT_NIGHT:
+                continue
+            if prev_dt and schedule[name][prev_dt] == SHIFT_NIGHT:
+                continue
+            if schedule[name][next_dt] == SHIFT_NIGHT:
+                continue
+            if schedule[name][next_dt] != SHIFT_WEEKOFF:
                 continue
 
-            category_rows.add((user_id, transaction_type, category, 0, now))
-            connection.execute(
-                """
-                INSERT INTO transactions
-                (user_id, transaction_date, transaction_type, category, amount, notes, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    transaction_date.strftime("%Y-%m-%d"),
-                    transaction_type,
-                    category,
-                    round(float(amount), 2),
-                    notes,
-                    now,
-                ),
-            )
-            inserted += 1
+            swap_candidates = [
+                other
+                for other in member_names
+                if other != name
+                and schedule[other][next_dt] == SHIFT_NIGHT
+                and schedule[other][dt] != SHIFT_NIGHT
+            ]
+            if not swap_candidates:
+                continue
 
-        if category_rows:
-            connection.executemany(
-                """
-                INSERT OR IGNORE INTO categories
-                (user_id, transaction_type, name, is_default, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                list(category_rows),
-            )
-        connection.commit()
-
-    if inserted == 0:
-        return False, f"No transactions were imported. Skipped {skipped} row(s)."
-
-    return True, f"Imported {inserted} transaction(s). Skipped {skipped} row(s)."
+            swap_out = sorted(swap_candidates, key=str.lower)[0]
+            schedule[name][next_dt] = SHIFT_NIGHT
+            schedule[swap_out][next_dt] = SHIFT_WEEKOFF
 
 
-def render_hero_header(user: dict[str, Any], transactions: pd.DataFrame) -> None:
-    month_start = pd.Timestamp.today().replace(day=1)
-    month_transactions = transactions[transactions["transaction_date"] >= month_start]
-    totals = summarize_totals(month_transactions)
-    top_category, top_amount = get_top_expense_category(month_transactions)
+def work_streak_if_shift_assigned(
+    schedule: Dict[str, Dict[date, str]],
+    member: str,
+    dt: date,
+    shift: str,
+    dates: List[date],
+    date_index: Dict[date, int],
+) -> int:
+    if not is_working_shift(shift):
+        return 0
 
-    st.markdown(
-        f"""
-        <div class="hero-card">
-          <div class="hero-eyebrow">Expense and Credit Tracker</div>
-          <h1 class="hero-title">Welcome, {html.escape(user["full_name"])}</h1>
-          <div class="hero-copy">
-            A clearer mobile-first view of your money, with quick actions, simple filters,
-            and easy-to-read summaries for spending, credits, and trends.
-          </div>
-          <div class="hero-stats">
-            <div class="hero-stat">
-              <div class="hero-stat-label">This month spent</div>
-              <div class="hero-stat-value">{format_currency(totals["expense_total"])}</div>
-            </div>
-            <div class="hero-stat">
-              <div class="hero-stat-label">This month credited</div>
-              <div class="hero-stat-value">{format_currency(totals["credit_total"])}</div>
-            </div>
-            <div class="hero-stat">
-              <div class="hero-stat-label">Top spending category</div>
-              <div class="hero-stat-value">{html.escape(top_category)}</div>
-              <div class="hero-stat-label">{format_currency(top_amount)}</div>
-            </div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    idx = date_index[dt]
+    left = 0
+    scan = idx - 1
+    while scan >= 0 and is_working_shift(schedule[member][dates[scan]]):
+        left += 1
+        scan -= 1
+
+    right = 0
+    scan = idx + 1
+    while scan < len(dates) and is_working_shift(schedule[member][dates[scan]]):
+        right += 1
+        scan += 1
+
+    return left + 1 + right
 
 
-def render_filter_panel(transactions: pd.DataFrame) -> pd.DataFrame:
-    st.markdown(
-        """
-        <div class="section-hint">
-          Use these filters to focus the overview, charts, and transaction list on the dates and activity type you care about.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+def can_take_rebalanced_shift(
+    schedule: Dict[str, Dict[date, str]],
+    member: str,
+    dt: date,
+    shift: str,
+    dates: List[date],
+    date_index: Dict[date, int],
+    member_map: Dict[str, Member],
+    locked_weekoffs: Set[Tuple[str, date]],
+) -> bool:
+    if schedule[member][dt] != SHIFT_WEEKOFF:
+        return False
+    if (member, dt) in locked_weekoffs:
+        return False
+    if shift not in {SHIFT_MORNING, SHIFT_AFTERNOON}:
+        return False
 
-    min_date, max_date = get_date_defaults(transactions)
-    filter_col_1, filter_col_2 = st.columns([1, 1.4])
-    with filter_col_1:
-        transaction_filter = st.selectbox("Show", ["All", "Expense", "Credit"])
-    with filter_col_2:
-        selected_date_range = st.date_input(
-            "Date range",
-            value=(min_date, max_date),
-            min_value=min_date,
-            max_value=max_date,
+    member_info = member_map[member]
+    if member_info.afternoon_only:
+        if dt.weekday() >= 5:
+            return False
+        if shift != SHIFT_AFTERNOON:
+            return False
+
+    return work_streak_if_shift_assigned(schedule, member, dt, shift, dates, date_index) <= MAX_CONTINUOUS_WORKING_DAYS
+
+
+def rebalance_weekoff_targets(
+    schedule: Dict[str, Dict[date, str]],
+    member_names: List[str],
+    dates: List[date],
+    target_wo: int,
+    bank_holidays: Set[date],
+    member_map: Dict[str, Member],
+):
+    locked_weekoffs: Set[Tuple[str, date]] = set()
+    date_index = {dt: idx for idx, dt in enumerate(dates)}
+    for name in member_names:
+        for idx, dt in enumerate(dates):
+            if schedule[name][dt] != SHIFT_NIGHT:
+                continue
+
+            prev_dt = dates[idx - 1] if idx > 0 else None
+            next_dt = dates[idx + 1] if idx + 1 < len(dates) else None
+            is_block_start = prev_dt is None or schedule[name][prev_dt] != SHIFT_NIGHT
+            is_block_end = next_dt is None or schedule[name][next_dt] != SHIFT_NIGHT
+
+            if is_block_start and prev_dt and schedule[name][prev_dt] == SHIFT_WEEKOFF:
+                locked_weekoffs.add((name, prev_dt))
+
+            if is_block_end:
+                for future_idx in range(idx + 1, min(idx + 1 + MANDATORY_OFF_AFTER_NIGHT, len(dates))):
+                    future_dt = dates[future_idx]
+                    if schedule[name][future_dt] == SHIFT_WEEKOFF:
+                        locked_weekoffs.add((name, future_dt))
+
+    month_wo = {
+        name: sum(1 for dt in dates if schedule[name][dt] == SHIFT_WEEKOFF)
+        for name in member_names
+    }
+
+    changed = True
+    while changed:
+        changed = False
+        over_target = sorted(
+            [name for name in member_names if month_wo[name] > target_wo],
+            key=lambda name: (month_wo[name], member_map[name].afternoon_only, name.lower()),
+            reverse=True,
+        )
+        under_target = sorted(
+            [name for name in member_names if month_wo[name] < target_wo],
+            key=lambda name: (month_wo[name], name.lower()),
         )
 
-    if isinstance(selected_date_range, tuple):
-        date_range = selected_date_range
-    else:
-        date_range = (selected_date_range, selected_date_range)
-    return get_filtered_transactions(transactions, transaction_filter, date_range)
+        for over_name in over_target:
+            if month_wo[over_name] <= target_wo:
+                continue
+
+            for under_name in under_target:
+                if over_name == under_name or month_wo[under_name] >= target_wo:
+                    continue
+
+                for dt in dates:
+                    transferred_shift = schedule[under_name][dt]
+                    if transferred_shift not in {SHIFT_MORNING, SHIFT_AFTERNOON}:
+                        continue
+                    if not can_take_rebalanced_shift(
+                        schedule,
+                        over_name,
+                        dt,
+                        transferred_shift,
+                        dates,
+                        date_index,
+                        member_map,
+                        locked_weekoffs,
+                    ):
+                        continue
+
+                    schedule[over_name][dt] = transferred_shift
+                    schedule[under_name][dt] = SHIFT_WEEKOFF
+                    month_wo[over_name] -= 1
+                    month_wo[under_name] += 1
+                    changed = True
+                    break
+
+                if changed:
+                    break
+
+            if changed:
+                break
 
 
-def render_quick_insights(filtered_transactions: pd.DataFrame) -> None:
-    st.subheader("Quick Insights")
-    if filtered_transactions.empty:
-        st.info("Add or filter transactions to see simple takeaways here.")
-        return
-
-    top_category, top_amount = get_top_expense_category(filtered_transactions)
-    largest = get_largest_transaction(filtered_transactions)
-    latest = filtered_transactions.iloc[0].to_dict()
-
-    insights = [
-        (
-            "Top expense category",
-            f"{top_category}",
-            f"Spent {format_currency(top_amount)} in the current filtered view.",
-        ),
-        (
-            "Largest transaction",
-            format_transaction_amount(float(largest["amount"]), str(largest["transaction_type"]))
-            if largest
-            else "No transactions",
-            f"{str(largest['transaction_type']).title()} in {largest['category']}" if largest else "",
-        ),
-        (
-            "Latest activity",
-            latest["category"],
-            f"{latest['transaction_date'].strftime('%d %b %Y')} | {str(latest['transaction_type']).title()}",
-        ),
-    ]
-
-    insight_columns = st.columns(len(insights))
-    for column, (label, value, note) in zip(insight_columns, insights):
-        with column:
-            st.markdown(
-                f"""
-                <div class="insight-card">
-                  <div class="insight-label">{html.escape(label)}</div>
-                  <div class="insight-value">{html.escape(str(value))}</div>
-                  <div class="muted-copy">{html.escape(str(note))}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+def can_assign_shift(name: str, shift: str, dt: date, schedule: Dict[str, Dict[date, str]], stats_map: Dict[str, dict], member_map: Dict[str, Member]) -> bool:
+    if schedule[name][dt] != SHIFT_UNASSIGNED:
+        return False
+    member = member_map[name]
+    if member.afternoon_only:
+        if dt.weekday() >= 5:
+            return False
+        if shift != SHIFT_AFTERNOON:
+            return False
+    if stats_map[name]["continuous_work"] >= MAX_CONTINUOUS_WORKING_DAYS:
+        return False
+    if shift == SHIFT_NIGHT and stats_map[name]["continuous_night"] >= MAX_CONTINUOUS_NIGHT:
+        return False
+    return True
 
 
-def render_recent_transactions_cards(filtered_transactions: pd.DataFrame, limit: int = 6) -> None:
-    st.subheader("Recent Transactions")
-    if filtered_transactions.empty:
-        st.info("No transactions match the current filter.")
-        return
-
-    for _, row in filtered_transactions.head(limit).iterrows():
-        note = row["notes"] if str(row["notes"]).strip() else "No note added"
-        st.markdown(
-            f"""
-            <div class="tx-card">
-              <div class="tx-top">
-                <div>
-                  <div class="tx-title">{html.escape(str(row["category"]))}</div>
-                  <div class="tx-meta">
-                    {row["transaction_date"].strftime('%d %b %Y')} | {html.escape(str(row["transaction_type"]).title())}
-                  </div>
-                </div>
-                <div class="tx-amount {html.escape(str(row["transaction_type"]))}">
-                  {html.escape(format_transaction_amount(float(row["amount"]), str(row["transaction_type"])))}
-                </div>
-              </div>
-              <div class="muted-copy">{html.escape(str(note))}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-
-def render_recap_section(user: dict[str, Any]) -> None:
-    st.subheader("Monthly Recap Email")
-    st.caption(
-        f"Send yourself a monthly summary at {user['email']}. SMTP must be configured first."
-    )
-    recap_month = st.date_input(
-        "Send recap for month",
-        value=(pd.Timestamp.today().replace(day=1) - pd.DateOffset(months=1)).date(),
-        key="self_recap_month",
-    )
-    if st.button("Email My Monthly Recap", use_container_width=True):
-        recap_start = pd.Timestamp(recap_month).replace(day=1)
-        sent, message = send_monthly_recap_email(user, recap_start)
-        if sent:
-            st.success(f"Monthly recap sent to {user['email']}.")
-        else:
-            st.error(f"Monthly recap could not be sent: {message}")
+def assign_shift_with_sync(
+    shift: str,
+    selected_names: List[str],
+    dt: date,
+    schedule: Dict[str, Dict[date, str]],
+    shift_counts: Dict[str, Dict[str, int]],
+    stats_map: Dict[str, dict],
+    member_map: Dict[str, Member],
+    sync_groups: Dict[str, List[str]],
+    warnings: List[dict],
+):
+    for primary in selected_names:
+        if not can_assign_shift(primary, shift, dt, schedule, stats_map, member_map):
+            continue
+        schedule[primary][dt] = shift
+        shift_counts[shift][primary] += 1
+        for follower in sync_groups.get(primary, []):
+            if can_assign_shift(follower, shift, dt, schedule, stats_map, member_map):
+                schedule[follower][dt] = shift
+                shift_counts[shift][follower] += 1
+            else:
+                current = schedule[follower][dt]
+                reason = "rule constraint"
+                if current == SHIFT_LEAVE:
+                    reason = "leave"
+                elif current == SHIFT_WEEKOFF:
+                    reason = "week off"
+                elif member_map[follower].afternoon_only and shift != SHIFT_AFTERNOON:
+                    reason = "afternoon-only exception"
+                warnings.append({
+                    "date": dt.isoformat(),
+                    "warning": f"Sync not possible: {follower} could not match {primary}'s {shift} shift due to {reason}."
+                })
 
 
-def get_filtered_transactions(
-    transactions: pd.DataFrame,
-    transaction_filter: str,
-    date_range: tuple[date, date],
-) -> pd.DataFrame:
-    filtered = transactions.copy()
-    if transaction_filter != "All":
-        filtered = filtered[filtered["transaction_type"] == transaction_filter.lower()]
+def style_matrix(df: pd.DataFrame, bank_holidays: Set[date]):
+    date_cols = [c for c in df.columns if isinstance(c, str) and c[:4].isdigit()]
 
-    start_date = pd.Timestamp(date_range[0])
-    end_date = pd.Timestamp(date_range[1])
-    filtered = filtered[
-        filtered["transaction_date"].between(
-            start_date, end_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-        )
-    ]
-    return filtered.sort_values(["transaction_date", "id"], ascending=[False, False]).reset_index(
-        drop=True
-    )
+    def color_cell(val):
+        for shift, code in SHIFT_CODE_MAP.items():
+            if val == code:
+                return f"background-color: {SHIFT_COLOR_MAP[shift]}; color: #F7FBFF; text-align:center; border: 1px solid rgba(255,255,255,0.06);"
+        return ""
+
+    styled = df.style.map(color_cell, subset=date_cols)
+    header_styles = []
+    for col in df.columns:
+        if col in date_cols:
+            dt = datetime.strptime(col, "%Y-%m-%d").date()
+            if dt in bank_holidays:
+                header_styles.append(
+                    {"selector": f"th.col_heading.level0.col{df.columns.get_loc(col)}", "props": "background-color: #173B5E; color: #F7FBFF;"}
+                )
+    if header_styles:
+        styled = styled.set_table_styles(header_styles, overwrite=False)
+    return styled
 
 
-def summarize_totals(transactions: pd.DataFrame) -> dict[str, float]:
-    expense_total = transactions.loc[
-        transactions["transaction_type"] == "expense", "amount"
-    ].sum()
-    credit_total = transactions.loc[
-        transactions["transaction_type"] == "credit", "amount"
-    ].sum()
+def to_excel_bytes(matrix_df: pd.DataFrame, full_df: pd.DataFrame, daywise_df: pd.DataFrame, summary_df: pd.DataFrame, warnings_df: pd.DataFrame, bank_holidays: Set[date]) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        matrix_df.to_excel(writer, index=False, sheet_name="ROTA Matrix")
+        full_df.to_excel(writer, index=False, sheet_name="Full Shift Matrix")
+        daywise_df.to_excel(writer, index=False, sheet_name="Day Wise Schedule")
+        summary_df.to_excel(writer, index=False, sheet_name="Summary")
+        warnings_df.to_excel(writer, index=False, sheet_name="Warnings")
+
+        for sheet_name, df in {
+            "ROTA Matrix": matrix_df,
+            "Full Shift Matrix": full_df,
+            "Day Wise Schedule": daywise_df,
+            "Summary": summary_df,
+            "Warnings": warnings_df,
+        }.items():
+            ws = writer.sheets[sheet_name]
+            for cell in ws[1]:
+                cell.fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+                cell.font = Font(color="FFFFFF", bold=True)
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            for idx, col in enumerate(df.columns, start=1):
+                max_len = max(len(str(col)), *(len(str(v)) for v in df[col].fillna(""))) + 2
+                ws.column_dimensions[get_column_letter(idx)].width = min(max_len, 22)
+
+            if sheet_name in {"ROTA Matrix", "Full Shift Matrix"}:
+                for col_idx, col_name in enumerate(df.columns, start=1):
+                    if isinstance(col_name, str) and col_name[:4].isdigit():
+                        dt = datetime.strptime(col_name, "%Y-%m-%d").date()
+                        if dt in bank_holidays:
+                            ws.cell(row=1, column=col_idx).fill = PatternFill(fill_type="solid", fgColor="CFE2F3")
+                        for row_idx in range(2, ws.max_row + 1):
+                            val = ws.cell(row=row_idx, column=col_idx).value
+                            shift_name = next((k for k, v in SHIFT_CODE_MAP.items() if v == val), None)
+                            if shift_name:
+                                ws.cell(row=row_idx, column=col_idx).fill = PatternFill(fill_type="solid", fgColor=SHIFT_COLOR_MAP[shift_name].replace("#", ""))
+                                ws.cell(row=row_idx, column=col_idx).alignment = Alignment(horizontal="center")
+    return output.getvalue()
+
+
+def shift_interval_for_date(shift_name: str, shift_date: date) -> Tuple[datetime, datetime] | Tuple[None, None]:
+    if shift_name not in SHIFT_TIME_MAP:
+        return None, None
+    start_t, end_t = SHIFT_TIME_MAP[shift_name]
+    start_dt = datetime.combine(shift_date, start_t)
+    end_dt = datetime.combine(shift_date, end_t)
+    if end_dt <= start_dt:
+        end_dt += timedelta(days=1)
+    return start_dt, end_dt
+
+
+def compute_change_availability(full_df: pd.DataFrame, change_start: datetime, change_end: datetime, max_per_shift: int = 3) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if full_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    date_cols = [c for c in full_df.columns if isinstance(c, str) and c[:4].isdigit()]
+    detail_rows = []
+
+    for _, row in full_df.iterrows():
+        name = row["name"]
+        dept = row.get("dept", "")
+        file_id = row.get("file_id", "")
+        phone_number = row.get("phone_number", "")
+
+        for col in date_cols:
+            shift_name = row[col]
+            if shift_name not in SHIFT_TIME_MAP:
+                continue
+
+            shift_date = datetime.strptime(col, "%Y-%m-%d").date()
+            shift_start, shift_end = shift_interval_for_date(shift_name, shift_date)
+            overlap_start = max(change_start, shift_start)
+            overlap_end = min(change_end, shift_end)
+            overlap_seconds = (overlap_end - overlap_start).total_seconds()
+
+            if overlap_seconds > 0:
+                detail_rows.append({
+                    "name": name,
+                    "dept": dept,
+                    "file_id": file_id,
+                    "phone_number": phone_number,
+                    "rota_date": col,
+                    "shift": shift_name,
+                    "shift_start_gmt": shift_start.strftime("%Y-%m-%d %H:%M"),
+                    "shift_end_gmt": shift_end.strftime("%Y-%m-%d %H:%M"),
+                    "overlap_start_gmt": overlap_start.strftime("%Y-%m-%d %H:%M"),
+                    "overlap_end_gmt": overlap_end.strftime("%Y-%m-%d %H:%M"),
+                    "overlap_hours": round(overlap_seconds / 3600, 2),
+                })
+
+    details_df = pd.DataFrame(detail_rows)
+    empty_summary = pd.DataFrame(columns=["name", "dept", "file_id", "phone_number", "shift", "rota_date", "overlap_hours", "shift_start_gmt", "shift_end_gmt"])
+    if details_df.empty:
+        return details_df, empty_summary
+
+    details_df = details_df.sort_values(
+        by=["rota_date", "shift", "overlap_hours", "name"],
+        ascending=[True, True, False, True]
+    ).copy()
+    details_df["rank_within_shift"] = details_df.groupby(["rota_date", "shift"]).cumcount() + 1
+    allocated_df = details_df[details_df["rank_within_shift"] <= max_per_shift].copy()
+
+    per_shift_summary = allocated_df[[
+        "name", "dept", "file_id", "phone_number", "shift", "rota_date", "overlap_hours", "shift_start_gmt", "shift_end_gmt"
+    ]].sort_values(by=["rota_date", "shift", "overlap_hours", "name"], ascending=[True, True, False, True])
+
+    return allocated_df.sort_values(by=["rota_date", "shift", "name"]), per_shift_summary
+
+
+def extract_date_columns(df: pd.DataFrame) -> List[str]:
+    return [c for c in df.columns if isinstance(c, str) and c[:4].isdigit()]
+
+
+def normalize_full_rota_df(full_df: pd.DataFrame) -> pd.DataFrame:
+    df = full_df.copy()
+    for col in extract_date_columns(df):
+        df[col] = df[col].fillna(SHIFT_WEEKOFF).astype(str).str.strip()
+        df[col] = df[col].replace("", SHIFT_WEEKOFF)
+    return df
+
+
+def build_rota_views_from_full_df(full_df: pd.DataFrame, bank_holidays: Set[date]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    full_df = normalize_full_rota_df(full_df)
+    date_cols = extract_date_columns(full_df)
+    matrix_rows: List[dict] = []
+    daywise_rows: List[dict] = []
+    summary_rows: List[dict] = []
+
+    for _, row in full_df.iterrows():
+        matrix_row = {
+            "name": row.get("name", ""),
+            "dept": row.get("dept", ""),
+            "file_id": row.get("file_id", ""),
+            "phone_number": row.get("phone_number", ""),
+            "primary_for": row.get("primary_for", ""),
+            "synced_to": row.get("synced_to", ""),
+        }
+        for col in date_cols:
+            shift_name = row.get(col, SHIFT_WEEKOFF)
+            matrix_row[col] = SHIFT_CODE_MAP.get(shift_name, SHIFT_CODE_MAP[SHIFT_UNASSIGNED])
+        matrix_rows.append(matrix_row)
+
+        summary_rows.append({
+            "name": row.get("name", ""),
+            "dept": row.get("dept", ""),
+            "file_id": row.get("file_id", ""),
+            "phone_number": row.get("phone_number", ""),
+            "synced_to": row.get("synced_to", ""),
+            "primary_for": row.get("primary_for", ""),
+            "morning_shifts": sum(1 for col in date_cols if row.get(col) == SHIFT_MORNING),
+            "afternoon_shifts": sum(1 for col in date_cols if row.get(col) == SHIFT_AFTERNOON),
+            "night_shifts": sum(1 for col in date_cols if row.get(col) == SHIFT_NIGHT),
+            "weekoffs_used": sum(1 for col in date_cols if row.get(col) == SHIFT_WEEKOFF),
+            "weekoffs_target": "",
+            "leave_days": sum(1 for col in date_cols if row.get(col) == SHIFT_LEAVE),
+            "working_days": sum(1 for col in date_cols if is_working_shift(row.get(col, SHIFT_UNASSIGNED))),
+        })
+
+    for col in date_cols:
+        dt = datetime.strptime(col, "%Y-%m-%d").date()
+        counts = {s: [] for s in [SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT, SHIFT_WEEKOFF, SHIFT_LEAVE]}
+        for _, row in full_df.iterrows():
+            shift_name = row.get(col, SHIFT_WEEKOFF)
+            if shift_name in counts:
+                counts[shift_name].append(str(row.get("name", "")))
+        daywise_rows.append({
+            "date": col,
+            "day": dt.strftime("%A"),
+            "bank_holiday": "Yes" if dt in bank_holidays else "No",
+            "morning_count": len(counts[SHIFT_MORNING]),
+            "afternoon_count": len(counts[SHIFT_AFTERNOON]),
+            "night_count": len(counts[SHIFT_NIGHT]),
+            "weekoff_count": len(counts[SHIFT_WEEKOFF]),
+            "leave_count": len(counts[SHIFT_LEAVE]),
+            "morning_names": ", ".join(counts[SHIFT_MORNING]),
+            "afternoon_names": ", ".join(counts[SHIFT_AFTERNOON]),
+            "night_names": ", ".join(counts[SHIFT_NIGHT]),
+            "weekoff_names": ", ".join(counts[SHIFT_WEEKOFF]),
+            "leave_names": ", ".join(counts[SHIFT_LEAVE]),
+            "status": "OK" if len(counts[SHIFT_MORNING]) >= MIN_MORNING and len(counts[SHIFT_AFTERNOON]) >= MIN_AFTERNOON and len(counts[SHIFT_NIGHT]) >= MIN_NIGHT else "Warning",
+        })
+
+    return pd.DataFrame(matrix_rows), pd.DataFrame(daywise_rows), pd.DataFrame(summary_rows)
+
+
+def build_override_warnings(full_df: pd.DataFrame) -> pd.DataFrame:
+    warnings: List[dict] = []
+    date_cols = extract_date_columns(full_df)
+    for col in date_cols:
+        counts = full_df[col].value_counts(dropna=False).to_dict()
+        for shift_name, minimum in [(SHIFT_MORNING, MIN_MORNING), (SHIFT_AFTERNOON, MIN_AFTERNOON), (SHIFT_NIGHT, MIN_NIGHT)]:
+            assigned = int(counts.get(shift_name, 0))
+            if assigned < minimum:
+                warnings.append({"date": col, "warning": f"Manual override: {shift_name} assigned {assigned} < required {minimum}"})
+    return pd.DataFrame(warnings or [{"date": "", "warning": "No warnings"}])
+
+
+def save_overridden_rota(full_df: pd.DataFrame, metadata: dict, bank_holidays: Set[date]) -> dict:
+    normalized_full_df = normalize_full_rota_df(full_df)
+    matrix_df, daywise_df, summary_df = build_rota_views_from_full_df(normalized_full_df, bank_holidays)
+    warnings_df = build_override_warnings(normalized_full_df)
+    excel_bytes = to_excel_bytes(matrix_df, normalized_full_df, daywise_df, summary_df, warnings_df, bank_holidays)
+
+    start_date = date.fromisoformat(metadata.get("start_date", extract_date_columns(normalized_full_df)[0]))
+    end_date = date.fromisoformat(metadata.get("end_date", extract_date_columns(normalized_full_df)[-1]))
+    save_generated_rota(matrix_df, normalized_full_df, daywise_df, summary_df, warnings_df, bank_holidays, start_date, end_date, excel_bytes)
+
+    updated_metadata = dict(metadata)
+    updated_metadata["saved_at"] = datetime.utcnow().isoformat(timespec="seconds")
+    updated_metadata["manual_override"] = True
+
     return {
-        "expense_total": float(expense_total),
-        "credit_total": float(credit_total),
-        "net_total": float(credit_total - expense_total),
+        "metadata": updated_metadata,
+        "matrix_df": matrix_df,
+        "full_df": normalized_full_df,
+        "daywise_df": daywise_df,
+        "summary_df": summary_df,
+        "warnings_df": warnings_df,
+        "bank_holidays": bank_holidays,
+        "excel_bytes": excel_bytes,
     }
 
 
-def build_period_stats(transactions: pd.DataFrame) -> pd.DataFrame:
-    if transactions.empty:
-        return pd.DataFrame(columns=["Period", "Transactions", "Expenses", "Credits", "Net"])
+MANUAL_SHIFT_VALUE_MAP = {
+    "m": SHIFT_MORNING,
+    "morning": SHIFT_MORNING,
+    "a": SHIFT_AFTERNOON,
+    "afternoon": SHIFT_AFTERNOON,
+    "n": SHIFT_NIGHT,
+    "night": SHIFT_NIGHT,
+    "wo": SHIFT_WEEKOFF,
+    "week off": SHIFT_WEEKOFF,
+    "weekoff": SHIFT_WEEKOFF,
+    "w/o": SHIFT_WEEKOFF,
+    "l": SHIFT_LEAVE,
+    "leave": SHIFT_LEAVE,
+}
 
-    today = pd.Timestamp.today().normalize()
-    periods = {
-        "Today": (today, today + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)),
-        "This Week": (
-            today - pd.Timedelta(days=today.weekday()),
-            today + pd.Timedelta(days=1) - pd.Timedelta(seconds=1),
-        ),
-        "This Month": (
-            today.replace(day=1),
-            today + pd.Timedelta(days=1) - pd.Timedelta(seconds=1),
-        ),
-    }
 
-    rows = []
-    for label, (start, end) in periods.items():
-        current = transactions[transactions["transaction_date"].between(start, end)]
-        totals = summarize_totals(current)
-        rows.append(
-            {
-                "Period": label,
-                "Transactions": int(len(current)),
-                "Expenses": totals["expense_total"],
-                "Credits": totals["credit_total"],
-                "Net": totals["net_total"],
-            }
-        )
+def build_manual_rota_template_df(members: List[Member], dates: List[date], sync_groups: Dict[str, List[str]]) -> pd.DataFrame:
+    follower_to_primary = {follower: primary for primary, followers in sync_groups.items() for follower in followers}
+    rows: List[dict] = []
+    for member in members:
+        row = {
+            "name": member.name,
+            "dept": member.dept,
+            "file_id": member.file_id,
+            "phone_number": member.phone_number,
+            "primary_for": ", ".join(sync_groups.get(member.name, [])),
+            "synced_to": follower_to_primary.get(member.name, ""),
+        }
+        for dt in dates:
+            row[dt.isoformat()] = ""
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
-def build_monthly_summary(transactions: pd.DataFrame) -> pd.DataFrame:
-    if transactions.empty:
-        return pd.DataFrame(columns=["month", "Expense", "Credit", "Net"])
-
-    monthly = (
-        transactions.assign(month=transactions["transaction_date"].dt.to_period("M").dt.to_timestamp())
-        .groupby(["month", "transaction_type"], as_index=False)["amount"]
-        .sum()
+def manual_rota_template_bytes(template_df: pd.DataFrame, start_date: date, end_date: date) -> bytes:
+    instructions_df = pd.DataFrame(
+        [
+            {"field": "Allowed shifts", "value": "Morning, Afternoon, Night, Week Off, Leave"},
+            {"field": "Allowed short codes", "value": "M, A, N, WO, L"},
+            {"field": "Date range", "value": f"{start_date.isoformat()} to {end_date.isoformat()}"},
+            {"field": "Required rows", "value": "Upload all current team members with one row per member"},
+            {"field": "Required date cells", "value": "Fill every rota date cell before uploading"},
+        ]
     )
 
-    pivot = (
-        monthly.pivot(index="month", columns="transaction_type", values="amount")
-        .fillna(0)
-        .rename(columns={"expense": "Expense", "credit": "Credit"})
-        .reset_index()
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        template_df.to_excel(writer, index=False, sheet_name="Manual Rota Template")
+        instructions_df.to_excel(writer, index=False, sheet_name="Instructions")
+        for sheet_name, df in {"Manual Rota Template": template_df, "Instructions": instructions_df}.items():
+            ws = writer.sheets[sheet_name]
+            for cell in ws[1]:
+                cell.fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+                cell.font = Font(color="FFFFFF", bold=True)
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            for idx, col in enumerate(df.columns, start=1):
+                max_len = max(len(str(col)), *(len(str(v)) for v in df[col].fillna(""))) + 2
+                ws.column_dimensions[get_column_letter(idx)].width = min(max_len, 28)
+    return output.getvalue()
+
+
+def read_uploaded_rota_sheet(uploaded_file) -> pd.DataFrame:
+    suffix = Path(uploaded_file.name).suffix.lower()
+    if suffix == ".csv":
+        return pd.read_csv(uploaded_file)
+
+    excel_file = pd.ExcelFile(uploaded_file)
+    preferred_sheet = next(
+        (sheet_name for sheet_name in ["Manual Rota Template", "Full Shift Matrix"] if sheet_name in excel_file.sheet_names),
+        excel_file.sheet_names[0],
     )
-    if "Expense" not in pivot:
-        pivot["Expense"] = 0.0
-    if "Credit" not in pivot:
-        pivot["Credit"] = 0.0
-    pivot["Net"] = pivot["Credit"] - pivot["Expense"]
-    return pivot.sort_values("month")
+    return pd.read_excel(excel_file, sheet_name=preferred_sheet)
 
 
-def log_notification(
-    event_type: str,
-    recipient_email: str,
-    subject: str,
-    body: str,
-    status: str,
-    error_message: str | None = None,
-) -> None:
-    with closing(get_connection()) as connection:
-        connection.execute(
-            """
-            INSERT INTO notifications
-            (event_type, recipient_email, subject, body, status, error_message, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event_type,
-                recipient_email,
-                subject,
-                body,
-                status,
-                error_message,
-                datetime.now().isoformat(),
-            ),
+def normalize_manual_shift_value(raw_value: Any, member_name: str, date_col: str) -> str:
+    if pd.isna(raw_value):
+        raise ValueError(f"Missing shift for {member_name} on {date_col}.")
+    cleaned = str(raw_value).strip()
+    if not cleaned:
+        raise ValueError(f"Missing shift for {member_name} on {date_col}.")
+
+    normalized = MANUAL_SHIFT_VALUE_MAP.get(cleaned.lower())
+    if normalized is None:
+        raise ValueError(
+            f"Invalid shift `{cleaned}` for {member_name} on {date_col}. Use Morning, Afternoon, Night, Week Off, Leave, or M/A/N/WO/L."
         )
-        connection.commit()
+    return normalized
 
 
-def send_email(recipient_email: str, subject: str, body: str, event_type: str) -> tuple[bool, str]:
-    smtp_config = get_smtp_config()
-    smtp_host = smtp_config["host"]
-    smtp_port = smtp_config["port"] or "587"
-    smtp_username = smtp_config["username"]
-    smtp_password = smtp_config["password"]
-    smtp_from_email = smtp_config["from_email"] or smtp_username or DEV_ACCOUNT_EMAIL
+def parse_manual_rota_upload_df(
+    uploaded_df: pd.DataFrame,
+    members: List[Member],
+    dates: List[date],
+    sync_groups: Dict[str, List[str]],
+) -> pd.DataFrame:
+    if uploaded_df.empty:
+        raise ValueError("Uploaded rota file is empty.")
 
-    if not smtp_host or not smtp_username or not smtp_password:
-        message = (
-            "SMTP is not configured. Set SMTP_HOST, SMTP_PORT, SMTP_USERNAME, "
-            "SMTP_PASSWORD, and optionally SMTP_FROM_EMAIL."
+    normalized_columns = {str(col).strip().lower(): col for col in uploaded_df.columns}
+    if "name" not in normalized_columns:
+        raise ValueError("Uploaded rota must include a `name` column.")
+
+    uploaded_df = uploaded_df.copy()
+    name_col = normalized_columns["name"]
+    uploaded_df["__normalized_name__"] = uploaded_df[name_col].astype(str).str.strip()
+    uploaded_df = uploaded_df[uploaded_df["__normalized_name__"] != ""].copy()
+    if uploaded_df.empty:
+        raise ValueError("Uploaded rota does not contain any member rows.")
+
+    if uploaded_df["__normalized_name__"].str.lower().duplicated().any():
+        duplicate_names = sorted(uploaded_df.loc[uploaded_df["__normalized_name__"].str.lower().duplicated(), "__normalized_name__"].unique().tolist())
+        raise ValueError(f"Uploaded rota has duplicate member rows: {', '.join(duplicate_names)}")
+
+    expected_names = {member.name.lower(): member.name for member in members}
+    uploaded_names = {name.lower(): name for name in uploaded_df["__normalized_name__"].tolist()}
+    missing_names = [expected_names[key] for key in expected_names.keys() - uploaded_names.keys()]
+    unexpected_names = [uploaded_names[key] for key in uploaded_names.keys() - expected_names.keys()]
+    if missing_names:
+        raise ValueError(f"Uploaded rota is missing members: {', '.join(sorted(missing_names))}")
+    if unexpected_names:
+        raise ValueError(f"Uploaded rota contains unknown members: {', '.join(sorted(unexpected_names))}")
+
+    expected_date_cols = [dt.isoformat() for dt in dates]
+    date_column_map = {str(col).strip(): col for col in uploaded_df.columns}
+    missing_date_cols = [col for col in expected_date_cols if col not in date_column_map]
+    if missing_date_cols:
+        raise ValueError(f"Uploaded rota is missing date columns: {', '.join(missing_date_cols[:8])}")
+
+    template_df = build_manual_rota_template_df(members, dates, sync_groups)
+    template_index = {str(row["name"]).strip().lower(): idx for idx, row in template_df.iterrows()}
+
+    for _, uploaded_row in uploaded_df.iterrows():
+        canonical_name = expected_names[str(uploaded_row["__normalized_name__"]).strip().lower()]
+        target_idx = template_index[canonical_name.lower()]
+        for date_col in expected_date_cols:
+            source_col = date_column_map[date_col]
+            template_df.at[target_idx, date_col] = normalize_manual_shift_value(uploaded_row[source_col], canonical_name, date_col)
+
+    return normalize_full_rota_df(template_df)
+
+
+def save_manual_uploaded_rota(full_df: pd.DataFrame, metadata: dict, bank_holidays: Set[date]) -> dict:
+    updated_bundle = save_overridden_rota(full_df, metadata, bank_holidays)
+    updated_bundle["metadata"]["manual_upload"] = True
+    return updated_bundle
+
+
+def generate_rota(
+    members: List[Member],
+    leaves: Dict[str, Set[date]],
+    start_date: date,
+    end_date: date,
+    global_weekoffs_per_month: int,
+    bank_holidays: Set[date],
+    sync_groups: Dict[str, List[str]],
+):
+    dates = dates_in_range(start_date, end_date)
+    member_names = [m.name for m in members]
+    member_map = {m.name: m for m in members}
+    targets = prorated_target(global_weekoffs_per_month, start_date, end_date)
+    follower_to_primary = {follower: primary for primary, followers in sync_groups.items() for follower in followers}
+
+    schedule: Dict[str, Dict[date, str]] = {m.name: {d: SHIFT_UNASSIGNED for d in dates} for m in members}
+    shift_counts = {
+        SHIFT_MORNING: {m.name: 0 for m in members},
+        SHIFT_AFTERNOON: {m.name: 0 for m in members},
+        SHIFT_NIGHT: {m.name: 0 for m in members},
+    }
+    warnings: List[dict] = []
+    planned_night_primaries, night_reservations, planning_warnings = plan_night_shift_blocks(
+        members,
+        leaves,
+        dates,
+        sync_groups,
+        bank_holidays,
+    )
+    warnings.extend(planning_warnings)
+
+    for name in member_names:
+        for d in leaves.get(name, set()):
+            if d in schedule[name]:
+                schedule[name][d] = SHIFT_LEAVE
+
+    for day_index, dt in enumerate(dates):
+        month = month_key(dt)
+        target_wo = targets[month]
+        restricted_staffing_day = is_restricted_staffing_day(dt, bank_holidays)
+        stats_map = {name: compute_stats_before_day(schedule, dates, day_index, name) for name in member_names}
+        month_wo_count = {name: stats_map[name]["month_wo"] for name in member_names}
+
+        for name in member_names:
+            if night_reservations[name].get(dt) == SHIFT_WEEKOFF and schedule[name][dt] == SHIFT_UNASSIGNED:
+                schedule[name][dt] = SHIFT_WEEKOFF
+                month_wo_count[name] += 1
+
+        planned_primary_names = planned_night_primaries.get(dt, [])
+        if planned_primary_names:
+            assign_shift_with_sync(
+                SHIFT_NIGHT,
+                planned_primary_names,
+                dt,
+                schedule,
+                shift_counts,
+                stats_map,
+                member_map,
+                sync_groups,
+                warnings,
+            )
+
+        available = []
+        forced_wo = []
+        for name in member_names:
+            current_status = schedule[name][dt]
+            if current_status != SHIFT_UNASSIGNED:
+                continue
+            if member_map[name].afternoon_only and dt.weekday() >= 5:
+                forced_wo.append(name)
+                continue
+            if stats_map[name]["continuous_work"] >= MAX_CONTINUOUS_WORKING_DAYS:
+                forced_wo.append(name)
+            else:
+                available.append(name)
+
+        for name in forced_wo:
+            schedule[name][dt] = SHIFT_WEEKOFF
+            month_wo_count[name] += 1
+
+        available = [n for n in member_names if schedule[n][dt] == SHIFT_UNASSIGNED]
+        minimum_needed = MIN_MORNING + MIN_AFTERNOON + MIN_NIGHT
+        max_possible_wo = max(0, len(available) - minimum_needed)
+        if restricted_staffing_day:
+            surplus = max_possible_wo
+        else:
+            surplus = planned_weekoffs_for_day(
+                dt=dt,
+                dates=dates,
+                day_index=day_index,
+                member_names=member_names,
+                month_wo_count=month_wo_count,
+                target_wo=target_wo,
+                max_allowed=max_possible_wo,
+            )
+
+        if surplus > 0:
+            candidates_for_wo = [n for n in available if not member_map[n].afternoon_only and n not in follower_to_primary]
+            for _ in range(surplus):
+                pick = choose_weekoff_candidate(candidates_for_wo, stats_map, target_wo, month_wo_count)
+                if pick is None:
+                    break
+                schedule[pick][dt] = SHIFT_WEEKOFF
+                month_wo_count[pick] += 1
+                if pick in available:
+                    available.remove(pick)
+                # if primary gets WO, try keeping synced followers available for staffing; sync can break if needed
+                candidates_for_wo = [n for n in available if not member_map[n].afternoon_only and n not in follower_to_primary]
+
+        available = [n for n in member_names if schedule[n][dt] == SHIFT_UNASSIGNED]
+        if len(available) < minimum_needed:
+            warnings.append({"date": dt.isoformat(), "warning": f"Only {len(available)} available resources. Minimum {minimum_needed} required."})
+
+        # Forced afternoon-only members go first.
+        afternoon_only_available = [n for n in available if member_map[n].afternoon_only and stats_map[n]["continuous_work"] < MAX_CONTINUOUS_WORKING_DAYS]
+        assign_shift_with_sync(
+            SHIFT_AFTERNOON,
+            afternoon_only_available,
+            dt,
+            schedule,
+            shift_counts,
+            stats_map,
+            member_map,
+            sync_groups,
+            warnings,
         )
-        log_notification(event_type, recipient_email, subject, body, "pending", message)
-        return False, message
 
-    email_message = EmailMessage()
-    email_message["Subject"] = subject
-    email_message["From"] = smtp_from_email
-    email_message["To"] = recipient_email
-    email_message.set_content(body)
+        available = [n for n in member_names if schedule[n][dt] == SHIFT_UNASSIGNED]
 
-    try:
-        with smtplib.SMTP(smtp_host, int(smtp_port), timeout=20) as smtp:
-            smtp.starttls()
-            smtp.login(smtp_username, smtp_password)
-            smtp.send_message(email_message)
-        log_notification(event_type, recipient_email, subject, body, "sent")
-        return True, "Email sent successfully."
-    except Exception as exc:
-        log_notification(event_type, recipient_email, subject, body, "failed", str(exc))
-        return False, str(exc)
+        # The planner pre-assigns continuous Night blocks. This fallback only runs if the
+        # preplanned owners could not cover the required Night staffing for the day.
+        current_night_count = sum(schedule[n][dt] == SHIFT_NIGHT for n in member_names)
+        remaining_night_need = max(0, MIN_NIGHT - current_night_count)
+        if remaining_night_need > 0:
+            fallback_pool = [n for n in member_names if schedule[n][dt] == SHIFT_UNASSIGNED]
+            if day_index > 0:
+                y = dates[day_index - 1]
+                continuing_night = [
+                    n for n in member_names
+                    if schedule[n][y] == SHIFT_NIGHT and can_assign_shift(n, SHIFT_NIGHT, dt, schedule, stats_map, member_map)
+                ]
+                continuing_night = sorted(
+                    continuing_night,
+                    key=lambda n: (
+                        n in follower_to_primary,
+                        -stats_map[n]["continuous_night"],
+                        shift_counts[SHIFT_NIGHT][n],
+                        n.lower(),
+                    ),
+                )
+            else:
+                continuing_night = []
 
+            remaining_after_continuity = max(0, remaining_night_need - len(continuing_night))
+            starter_pool = [
+                n for n in fallback_pool
+                if n not in continuing_night
+                and n not in follower_to_primary
+                and stats_map[n]["prev_shift"] != SHIFT_NIGHT
+                and stats_map[n]["month_night_blocks"] == 0
+            ]
+            if len(starter_pool) < remaining_after_continuity:
+                starter_pool = [
+                    n for n in fallback_pool
+                    if n not in continuing_night
+                    and stats_map[n]["prev_shift"] != SHIFT_NIGHT
+                    and stats_map[n]["month_night_blocks"] == 0
+                ]
+            if len(starter_pool) < remaining_after_continuity:
+                starter_pool = [
+                    n for n in fallback_pool
+                    if n not in continuing_night
+                    and n not in follower_to_primary
+                    and stats_map[n]["prev_shift"] != SHIFT_NIGHT
+                ]
+            if len(starter_pool) < remaining_after_continuity:
+                starter_pool = [
+                    n for n in fallback_pool
+                    if n not in continuing_night and stats_map[n]["prev_shift"] != SHIFT_NIGHT
+                ]
 
-def send_account_creation_notifications(user: dict[str, Any]) -> list[str]:
-    recipients = set(ADMIN_NOTIFICATION_EMAILS)
-    if DEV_ACCOUNT_EMAIL:
-        recipients.add(DEV_ACCOUNT_EMAIL)
+            night_selected = continuing_night[:remaining_night_need]
+            if len(night_selected) < remaining_night_need:
+                needed_starters = remaining_night_need - len(night_selected)
+                night_selected.extend(
+                    choose_shift_candidates(starter_pool, SHIFT_NIGHT, needed_starters, stats_map, shift_counts)
+                )
+            assign_shift_with_sync(
+                SHIFT_NIGHT,
+                night_selected,
+                dt,
+                schedule,
+                shift_counts,
+                stats_map,
+                member_map,
+                sync_groups,
+                warnings,
+            )
 
-    body = (
-        "A new user account has been created.\n\n"
-        f"Name: {user['full_name']}\n"
-        f"Username: {user['username']}\n"
-        f"Email: {user['email']}\n"
-        f"Created at: {user['created_at']}\n"
-    )
+        # Once today's night assignment is known, enforce post-night rest before filling other shifts.
+        if day_index > 0:
+            y = dates[day_index - 1]
+            for n in member_names:
+                if schedule[n][y] == SHIFT_NIGHT and schedule[n][dt] == SHIFT_UNASSIGNED:
+                    apply_night_block_offs(schedule, n, dates, day_index - 1, 1)
 
-    messages = []
-    for recipient in sorted(recipients):
-        sent, message = send_email(
-            recipient,
-            subject=f"New account created: {user['username']}",
-            body=body,
-            event_type="account_created",
+        # A maxed-out night streak immediately reserves the next 2 days as WO.
+        for n in member_names:
+            if schedule[n][dt] == SHIFT_NIGHT:
+                current_night_streak = 0
+                idx = day_index
+                while idx >= 0 and schedule[n][dates[idx]] == SHIFT_NIGHT:
+                    current_night_streak += 1
+                    idx -= 1
+                if current_night_streak >= MAX_CONTINUOUS_NIGHT:
+                    apply_night_block_offs(schedule, n, dates, day_index, 1)
+
+        available = [n for n in member_names if schedule[n][dt] == SHIFT_UNASSIGNED]
+        morning_pool = [n for n in available if n not in follower_to_primary]
+        if len(morning_pool) < MIN_MORNING:
+            morning_pool = available
+        morning_selected = choose_shift_candidates(morning_pool, SHIFT_MORNING, MIN_MORNING, stats_map, shift_counts)
+        assign_shift_with_sync(SHIFT_MORNING, morning_selected, dt, schedule, shift_counts, stats_map, member_map, sync_groups, warnings)
+
+        available = [n for n in member_names if schedule[n][dt] == SHIFT_UNASSIGNED]
+        current_afternoon_count = sum(schedule[n][dt] == SHIFT_AFTERNOON for n in member_names)
+        afternoon_need = max(0, MIN_AFTERNOON - current_afternoon_count)
+        afternoon_pool = [n for n in available if n not in follower_to_primary]
+        if len(afternoon_pool) < afternoon_need:
+            afternoon_pool = available
+        afternoon_selected = choose_shift_candidates(afternoon_pool, SHIFT_AFTERNOON, afternoon_need, stats_map, shift_counts)
+        assign_shift_with_sync(SHIFT_AFTERNOON, afternoon_selected, dt, schedule, shift_counts, stats_map, member_map, sync_groups, warnings)
+
+        available = [n for n in member_names if schedule[n][dt] == SHIFT_UNASSIGNED]
+        # Assign remaining members, preferring continuity with yesterday's shift but defaulting extra staff to Afternoon.
+        continuity_order = {SHIFT_NIGHT: 0, SHIFT_MORNING: 1, SHIFT_AFTERNOON: 2, None: 3, SHIFT_WEEKOFF: 4, SHIFT_LEAVE: 5}
+        remaining_sorted = sorted(
+            available,
+            key=lambda n: (
+                continuity_order.get(stats_map[n]["prev_shift"], 99),
+                stats_map[n]["continuous_work"],
+                n.lower(),
+            )
         )
-        status = "sent" if sent else "queued"
-        messages.append(f"{recipient}: {status}")
-        if not sent:
-            messages.append(message)
-    return messages
+        for n in remaining_sorted:
+            if restricted_staffing_day and schedule[n][dt] == SHIFT_UNASSIGNED:
+                schedule[n][dt] = SHIFT_WEEKOFF
+                month_wo_count[n] += 1
+                continue
+            prev_shift = stats_map[n]["prev_shift"]
+            preferred_shift = prev_shift if prev_shift in {SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT} else SHIFT_AFTERNOON
+            assigned = False
+            # Night assignments are controlled by the dedicated night selection step above.
+            # Keeping remaining assignments out of Night avoids fragmented night blocks.
+            shift_options = [preferred_shift, SHIFT_AFTERNOON, SHIFT_MORNING]
+            if SHIFT_AFTERNOON in shift_options:
+                shift_options = [SHIFT_AFTERNOON] + [s for s in shift_options if s != SHIFT_AFTERNOON]
+            shift_options = [s for s in shift_options if s != SHIFT_NIGHT]
+            for shift_option in shift_options:
+                if can_assign_shift(n, shift_option, dt, schedule, stats_map, member_map):
+                    assign_shift_with_sync(shift_option, [n], dt, schedule, shift_counts, stats_map, member_map, sync_groups, warnings)
+                    assigned = True
+                    break
+            if not assigned and schedule[n][dt] == SHIFT_UNASSIGNED:
+                schedule[n][dt] = SHIFT_WEEKOFF
+                month_wo_count[n] += 1
 
+        # Final sweep: any truly unassigned person becomes WO.
+        for n in member_names:
+            if schedule[n][dt] == SHIFT_UNASSIGNED:
+                schedule[n][dt] = SHIFT_WEEKOFF
+                month_wo_count[n] += 1
 
-def build_monthly_recap(user: dict[str, Any], month_start: pd.Timestamp) -> str:
-    month_end = month_start + pd.offsets.MonthEnd(0)
-    transactions = get_transactions_for_user(user["id"])
-    monthly_transactions = transactions[
-        transactions["transaction_date"].between(month_start, month_end)
-    ]
-    totals = summarize_totals(monthly_transactions)
+        day_counts = {
+            SHIFT_MORNING: sum(schedule[n][dt] == SHIFT_MORNING for n in member_names),
+            SHIFT_AFTERNOON: sum(schedule[n][dt] == SHIFT_AFTERNOON for n in member_names),
+            SHIFT_NIGHT: sum(schedule[n][dt] == SHIFT_NIGHT for n in member_names),
+        }
+        for shift_name, minimum in [(SHIFT_MORNING, MIN_MORNING), (SHIFT_AFTERNOON, MIN_AFTERNOON), (SHIFT_NIGHT, MIN_NIGHT)]:
+            if day_counts[shift_name] < minimum:
+                warnings.append({"date": dt.isoformat(), "warning": f"{shift_name}: assigned {day_counts[shift_name]} < required {minimum}"})
 
-    expense_breakdown = (
-        monthly_transactions[monthly_transactions["transaction_type"] == "expense"]
-        .groupby("category")["amount"]
-        .sum()
-        .sort_values(ascending=False)
-    )
+    for n in member_names:
+        idx = 0
+        while idx < len(dates):
+            if schedule[n][dates[idx]] == SHIFT_NIGHT:
+                while idx + 1 < len(dates) and schedule[n][dates[idx + 1]] == SHIFT_NIGHT:
+                    idx += 1
+                end_idx = idx
+                for j in range(end_idx + 1, min(end_idx + 1 + MANDATORY_OFF_AFTER_NIGHT, len(dates))):
+                    if schedule[n][dates[j]] == SHIFT_UNASSIGNED:
+                        schedule[n][dates[j]] = SHIFT_WEEKOFF
+                idx += 1
+            else:
+                idx += 1
 
-    top_categories = "\n".join(
-        f"- {category}: {format_currency(amount)}"
-        for category, amount in expense_breakdown.head(5).items()
-    )
-    if not top_categories:
-        top_categories = "- No expenses recorded"
+    rebalance_weekoff_targets(schedule, member_names, dates, target_wo, bank_holidays, member_map)
+
+    matrix_rows, full_rows, daywise_rows, summary_rows = [], [], [], []
+    sync_map_text = {m.name: ", ".join(sync_groups.get(m.name, [])) for m in members}
+    primary_text = {m.name: follower_to_primary.get(m.name, "") for m in members}
+    for m in members:
+        row_codes = {"name": m.name, "dept": m.dept, "file_id": m.file_id, "phone_number": m.phone_number, "primary_for": sync_map_text[m.name], "synced_to": primary_text[m.name]}
+        row_full = {"name": m.name, "dept": m.dept, "file_id": m.file_id, "phone_number": m.phone_number, "primary_for": sync_map_text[m.name], "synced_to": primary_text[m.name]}
+        for dt in dates:
+            col = dt.isoformat()
+            shift = schedule[m.name][dt]
+            row_codes[col] = SHIFT_CODE_MAP[shift]
+            row_full[col] = shift
+        matrix_rows.append(row_codes)
+        full_rows.append(row_full)
+
+    for dt in dates:
+        counts = {s: [] for s in [SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT, SHIFT_WEEKOFF, SHIFT_LEAVE]}
+        for n in member_names:
+            counts[schedule[n][dt]].append(n)
+        daywise_rows.append({
+            "date": dt.isoformat(),
+            "day": dt.strftime("%A"),
+            "bank_holiday": "Yes" if dt in bank_holidays else "No",
+            "morning_count": len(counts[SHIFT_MORNING]),
+            "afternoon_count": len(counts[SHIFT_AFTERNOON]),
+            "night_count": len(counts[SHIFT_NIGHT]),
+            "weekoff_count": len(counts[SHIFT_WEEKOFF]),
+            "leave_count": len(counts[SHIFT_LEAVE]),
+            "morning_names": ", ".join(counts[SHIFT_MORNING]),
+            "afternoon_names": ", ".join(counts[SHIFT_AFTERNOON]),
+            "night_names": ", ".join(counts[SHIFT_NIGHT]),
+            "weekoff_names": ", ".join(counts[SHIFT_WEEKOFF]),
+            "leave_names": ", ".join(counts[SHIFT_LEAVE]),
+            "status": "OK" if len(counts[SHIFT_MORNING]) >= MIN_MORNING and len(counts[SHIFT_AFTERNOON]) >= MIN_AFTERNOON and len(counts[SHIFT_NIGHT]) >= MIN_NIGHT else "Warning",
+        })
+
+    target_total = sum(prorated_target(global_weekoffs_per_month, start_date, end_date).values())
+    for m in members:
+        summary_rows.append({
+            "name": m.name,
+            "dept": m.dept,
+            "file_id": m.file_id,
+            "phone_number": m.phone_number,
+            "synced_to": primary_text[m.name],
+            "primary_for": sync_map_text[m.name],
+            "morning_shifts": sum(1 for dt in dates if schedule[m.name][dt] == SHIFT_MORNING),
+            "afternoon_shifts": sum(1 for dt in dates if schedule[m.name][dt] == SHIFT_AFTERNOON),
+            "night_shifts": sum(1 for dt in dates if schedule[m.name][dt] == SHIFT_NIGHT),
+            "weekoffs_used": sum(1 for dt in dates if schedule[m.name][dt] == SHIFT_WEEKOFF),
+            "weekoffs_target": target_total,
+            "leave_days": sum(1 for dt in dates if schedule[m.name][dt] == SHIFT_LEAVE),
+            "working_days": sum(1 for dt in dates if is_working_shift(schedule[m.name][dt])),
+        })
 
     return (
-        f"Monthly expense recap for {user['full_name']} ({month_start.strftime('%B %Y')})\n\n"
-        f"Transactions: {len(monthly_transactions)}\n"
-        f"Total expenses: {format_currency(totals['expense_total'])}\n"
-        f"Total credits: {format_currency(totals['credit_total'])}\n"
-        f"Net balance: {format_currency(totals['net_total'])}\n\n"
-        "Top expense categories:\n"
-        f"{top_categories}\n"
+        pd.DataFrame(matrix_rows),
+        pd.DataFrame(full_rows),
+        pd.DataFrame(daywise_rows),
+        pd.DataFrame(summary_rows),
+        pd.DataFrame(warnings or [{"date": "", "warning": "No warnings"}]),
     )
 
 
-def send_monthly_recap_email(user: dict[str, Any], month_start: pd.Timestamp) -> tuple[bool, str]:
-    subject = f"Your monthly expense recap - {month_start.strftime('%B %Y')}"
-    body = build_monthly_recap(user, month_start)
-    sent, message = send_email(user["email"], subject, body, "monthly_recap")
 
-    if sent:
-        with closing(get_connection()) as connection:
-            connection.execute(
-                "UPDATE users SET last_recap_month = ? WHERE id = ?",
-                (month_start.strftime("%Y-%m"), user["id"]),
-            )
-            connection.commit()
-    return sent, message
+# -----------------------------
+# Access control
+# -----------------------------
+DEFAULT_AUTH_USERS = {
+    "admin": {"password": "admin123", "role": "admin"},
+    "dev": {"password": "dev123", "role": "dev"},
+    "member": {"password": "member123", "role": "member"},
+}
 
-
-def send_due_monthly_recap_if_needed(user: dict[str, Any]) -> str | None:
-    today = pd.Timestamp.today()
-    previous_month = (today.replace(day=1) - pd.DateOffset(months=1)).to_period("M").to_timestamp()
-    recap_key = previous_month.strftime("%Y-%m")
-
-    if user.get("last_recap_month") == recap_key:
-        return None
-
-    sent, message = send_monthly_recap_email(user, previous_month)
-    if sent:
-        return f"Monthly recap sent to {user['email']} for {previous_month.strftime('%B %Y')}."
-    return f"Monthly recap could not be sent automatically: {message}"
+def normalize_username(username: str) -> str:
+    return str(username).strip().lower()
 
 
-def get_notification_log() -> pd.DataFrame:
-    with closing(get_connection()) as connection:
-        rows = connection.execute(
-            """
-            SELECT event_type, recipient_email, subject, status, error_message, created_at
-            FROM notifications
-            ORDER BY created_at DESC
-            LIMIT 200
-            """
+def load_auth_users() -> Dict[str, Dict[str, str]]:
+    payload = load_state(STATE_KEY_AUTH_USERS)
+    if not payload:
+        return {username: dict(config) for username, config in DEFAULT_AUTH_USERS.items()}
+
+    users: Dict[str, Dict[str, str]] = {}
+    for row in payload.get("users", []):
+        username = normalize_username(row.get("username", ""))
+        password = str(row.get("password", "")).strip()
+        role = str(row.get("role", "")).strip().lower()
+        if not username or not password or role not in {"admin", "dev", "member"}:
+            continue
+        users[username] = {"password": password, "role": role}
+
+    if not users:
+        return {username: dict(config) for username, config in DEFAULT_AUTH_USERS.items()}
+    return users
+
+
+def save_auth_users(users: Dict[str, Dict[str, str]]):
+    payload = {
+        "users": [
+            {"username": username, "password": config["password"], "role": config["role"]}
+            for username, config in sorted(users.items())
+        ]
+    }
+    save_state(STATE_KEY_AUTH_USERS, payload)
+
+
+def upsert_auth_user(username: str, password: str, role: str):
+    normalized_username = normalize_username(username)
+    normalized_role = str(role).strip().lower()
+    if not normalized_username:
+        raise ValueError("Username is required.")
+    if normalized_role not in {"admin", "dev", "member"}:
+        raise ValueError("Role must be admin, dev, or member.")
+
+    users = load_auth_users()
+    existing_password = users.get(normalized_username, {}).get("password", "")
+    effective_password = str(password).strip() or existing_password
+    if not effective_password:
+        raise ValueError("Password is required for a new user.")
+
+    users[normalized_username] = {"password": effective_password, "role": normalized_role}
+    if not any(config["role"] == "admin" for config in users.values()):
+        raise ValueError("At least one admin user must exist.")
+    save_auth_users(users)
+
+
+def delete_auth_user(username: str, current_user: str):
+    normalized_username = normalize_username(username)
+    users = load_auth_users()
+    if normalized_username not in users:
+        raise ValueError("Selected user was not found.")
+    if normalized_username == normalize_username(current_user):
+        raise ValueError("You cannot delete the account that is currently logged in.")
+
+    updated_users = {user: config for user, config in users.items() if user != normalized_username}
+    if not any(config["role"] == "admin" for config in updated_users.values()):
+        raise ValueError("At least one admin user must remain.")
+    save_auth_users(updated_users)
+
+
+def auth_users_df() -> pd.DataFrame:
+    users = load_auth_users()
+    rows = [
+        {"username": username, "role": config["role"]}
+        for username, config in sorted(users.items())
+    ]
+    return pd.DataFrame(rows, columns=["username", "role"])
+
+
+def log_activity(category: str, action: str, details: str = "", username: Optional[str] = None, role: Optional[str] = None):
+    actor_username = normalize_username(username if username is not None else st.session_state.get("auth_user", "system")) or "system"
+    actor_role = str(role if role is not None else st.session_state.get("auth_role", "system")).strip().lower() or "system"
+    payload = load_state(STATE_KEY_ACTIVITY_LOG) or {}
+    events = payload.get("events", [])
+    events.append(
+        {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "category": str(category).strip() or "General",
+            "action": str(action).strip() or "Activity",
+            "details": str(details).strip(),
+            "username": actor_username,
+            "role": actor_role,
+        }
+    )
+    save_state(STATE_KEY_ACTIVITY_LOG, {"events": events[-ACTIVITY_LOG_LIMIT:]})
+
+
+def activity_log_df() -> pd.DataFrame:
+    payload = load_state(STATE_KEY_ACTIVITY_LOG) or {}
+    rows = payload.get("events", [])
+    if not rows:
+        return pd.DataFrame(columns=["timestamp", "category", "action", "details", "username", "role"])
+    df = pd.DataFrame(rows)
+    expected_columns = ["timestamp", "category", "action", "details", "username", "role"]
+    for column in expected_columns:
+        if column not in df.columns:
+            df[column] = ""
+    return df[expected_columns].sort_values(by=["timestamp", "category", "action"], ascending=[False, True, True]).reset_index(drop=True)
+
+
+def app_state_summary_df() -> pd.DataFrame:
+    init_database()
+    with sqlite3.connect(DB_FILE) as conn:
+        rows = conn.execute(
+            "SELECT state_key, updated_at FROM app_state ORDER BY state_key"
         ).fetchall()
-    return pd.DataFrame([dict(row) for row in rows])
+    return pd.DataFrame(rows, columns=["state_key", "updated_at"])
 
 
-def render_google_ads(user: dict[str, Any]) -> None:
-    if user["role"] == "developer":
-        return
+def init_auth_state():
+    st.session_state.setdefault("auth_role", "general")
+    st.session_state.setdefault("auth_user", "General User")
+    st.session_state.setdefault("auth_logged_in", False)
+    st.session_state.setdefault("team_import_df", None)
 
-    st.markdown("### Sponsored")
+def login_user(username: str, password: str) -> bool:
+    user = load_auth_users().get(normalize_username(username))
+    if user and password == user["password"]:
+        st.session_state["auth_role"] = user["role"]
+        st.session_state["auth_user"] = normalize_username(username)
+        st.session_state["auth_logged_in"] = True
+        log_activity("Authentication", "Login", "Signed in successfully.", username=normalize_username(username), role=user["role"])
+        return True
+    return False
 
-    ads_client = os.getenv("GOOGLE_ADSENSE_CLIENT")
-    ads_slot = os.getenv("GOOGLE_ADSENSE_SLOT")
-    if ads_client and ads_slot:
-        ad_html = f"""
-        <div style="background:#f8fafc;border:1px solid #dbe4ee;padding:12px;border-radius:12px;margin:8px 0 20px 0;">
-          <ins class="adsbygoogle"
-               style="display:block"
-               data-ad-client="{ads_client}"
-               data-ad-slot="{ads_slot}"
-               data-ad-format="auto"
-               data-full-width-responsive="true"></ins>
-          <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
-          <script>(adsbygoogle = window.adsbygoogle || []).push({{}});</script>
-        </div>
-        """
-        components.html(ad_html, height=140)
-    else:
-        st.info(
-            "Google Ads placeholder. Set GOOGLE_ADSENSE_CLIENT and GOOGLE_ADSENSE_SLOT to show live ads."
-        )
-        with st.expander("How to enable live Google Ads"):
-            st.code(
-                'export GOOGLE_ADSENSE_CLIENT="ca-pub-xxxxxxxxxxxxxxxx"\n'
-                'export GOOGLE_ADSENSE_SLOT="1234567890"\n'
-                "streamlit run app.py",
-                language="bash",
-            )
-            st.caption(
-                "Replace the sample values with your own Google AdSense client ID and ad slot ID."
-            )
+def logout_user():
+    log_activity("Authentication", "Logout", "Signed out of the rota workspace.")
+    st.session_state["auth_role"] = "general"
+    st.session_state["auth_user"] = "General User"
+    st.session_state["auth_logged_in"] = False
 
 
-def render_login_screen() -> None:
+def render_page_hero(kicker: str, title: str, body: str, badges: Optional[List[str]] = None):
+    badges_html = ""
+    if badges:
+        badges_html = "<div class='hero-badges'>" + "".join(
+            f"<span class='hero-badge'>{escape(badge)}</span>" for badge in badges if badge
+        ) + "</div>"
     st.markdown(
-        """
-        <div class="hero-card">
-          <div class="hero-eyebrow">Personal Finance</div>
-          <h1 class="hero-title">Track money without the clutter</h1>
-          <div class="hero-copy">
-            Sign in or create an account to record expenses, credits, trends, and monthly recaps from a simpler mobile-friendly dashboard.
-          </div>
+        f"""
+        <section class="page-hero">
+            <div class="page-hero-kicker">{escape(kicker)}</div>
+            <div class="page-hero-title">{escape(title)}</div>
+            <div class="page-hero-copy">{escape(body)}</div>
+            {badges_html}
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_section_header(index_label: str, title: str, body: str):
+    st.markdown(
+        f"""
+        <section class="section-banner">
+            <div class="section-index">{escape(index_label)}</div>
+            <div class="section-title">{escape(title)}</div>
+            <div class="section-copy">{escape(body)}</div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_inline_note(tone: str, title: str, body: str):
+    st.markdown(
+        f"""
+        <div class="inline-note inline-note-{escape(tone)}">
+            <div class="inline-note-title">{escape(title)}</div>
+            <div class="inline-note-copy">{escape(body)}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    center_column = st.columns([0.08, 1, 0.08])[1]
-    with center_column:
-        login_tab, signup_tab = st.tabs(["Login", "Create Account"])
 
-        with login_tab:
-            with st.form("login_form"):
-                username = st.text_input("Username")
-                password = st.text_input("Password", type="password")
-                submitted = st.form_submit_button("Login", use_container_width=True)
+def render_dev_console(
+    team_df: pd.DataFrame,
+    leaves_df: pd.DataFrame,
+    sync_groups_df: pd.DataFrame,
+    start_date: date,
+    end_date: date,
+    bank_holiday_mode: str,
+    auto_bank_holiday_days: int,
+    specific_bank_holiday_df: pd.DataFrame,
+):
+    render_section_header("DX", "Developer Console", "Manage app users, roles, activity history, manual rota uploads, and local maintenance tasks from one place.")
+    render_inline_note("info", "Local authentication", "Usernames, passwords, roles, and activity history are stored locally in the rota database for this app.")
 
-            if submitted:
-                success, user, message = authenticate_user(username, password)
-                if success and user:
-                    st.session_state["user_id"] = user["id"]
-                    recap_message = send_due_monthly_recap_if_needed(user)
-                    if recap_message:
-                        st.session_state["flash_message"] = recap_message
+    console_tabs = st.tabs(["Users", "Activity", "Manual ROTA", "Maintenance"])
+
+    with console_tabs[0]:
+        users_df = auth_users_df()
+        admin_count = int((users_df["role"] == "admin").sum()) if not users_df.empty else 0
+        dev_count = int((users_df["role"] == "dev").sum()) if not users_df.empty else 0
+        member_count = int((users_df["role"] == "member").sum()) if not users_df.empty else 0
+
+        metric_1, metric_2, metric_3, metric_4 = st.columns(4)
+        with metric_1:
+            st.metric("Total users", int(len(users_df)))
+        with metric_2:
+            st.metric("Admins", admin_count)
+        with metric_3:
+            st.metric("Devs", dev_count)
+        with metric_4:
+            st.metric("Members", member_count)
+
+        st.markdown("#### Current users")
+        st.dataframe(users_df, width="stretch", hide_index=True)
+
+        manage_left, manage_right = st.columns(2)
+        with manage_left:
+            st.markdown("#### Add or update user")
+            with st.form("dev_user_upsert_form", clear_on_submit=True):
+                managed_username = st.text_input("Username")
+                managed_password = st.text_input(
+                    "Password",
+                    type="password",
+                    help="For an existing user, you can leave this blank to keep the current password and update only the role.",
+                )
+                managed_role = st.selectbox("Role", options=["member", "dev", "admin"], index=0)
+                save_user_clicked = st.form_submit_button("Save User", width="stretch")
+            if save_user_clicked:
+                try:
+                    upsert_auth_user(managed_username, managed_password, managed_role)
+                    normalized_managed_user = normalize_username(managed_username)
+                    if normalized_managed_user == normalize_username(st.session_state.get("auth_user", "")):
+                        st.session_state["auth_role"] = managed_role
+                    log_activity("User Management", "Save User", f"Saved user `{normalized_managed_user}` with role `{managed_role}`.")
+                    st.success(f"User `{normalized_managed_user}` saved.")
                     st.rerun()
-                st.error(message)
+                except Exception as e:
+                    st.error(str(e))
 
-        with signup_tab:
-            with st.form("signup_form"):
-                full_name = st.text_input("Full name")
-                username = st.text_input("Username", key="signup_username")
-                email = st.text_input("Email")
-                password = st.text_input("Password", type="password", key="signup_password")
-                submitted = st.form_submit_button("Create Account", use_container_width=True)
-
-            if submitted:
-                success, message = create_user(full_name, username, email, password)
-                if success:
-                    st.success(message)
-                    st.info(
-                        "A notification email is attempted for the developer account and sricharan2209@gmail.com."
-                    )
-                else:
-                    st.error(message)
-
-   # with st.expander("Developer login note", expanded=False):
-   #     st.warning(
-   #         f"Default developer login: username `{DEV_ACCOUNT_USERNAME}` and password `{DEV_ACCOUNT_PASSWORD}`. "
-   #         "Change these using DEV_ACCOUNT_USERNAME, DEV_ACCOUNT_PASSWORD, and DEV_ACCOUNT_EMAIL environment variables."
-   #     )
-
-
-def render_add_transaction_section(user: dict[str, Any], categories: dict[str, list[str]]) -> None:
-    st.subheader("+ Add Transaction")
-    st.caption("Record a new expense or credit in a few quick steps.")
-
-    top_row = st.columns([1, 1])
-    transaction_date = top_row[0].date_input("Date", key="add_tx_date")
-    transaction_type_label = top_row[1].radio(
-        "Type",
-        list(TYPE_LABELS.values()),
-        horizontal=True,
-        key="add_tx_type_label",
-    )
-    transaction_type = transaction_type_label.lower()
-
-    category_options = [*categories[transaction_type], ADD_CUSTOM_OPTION]
-    if st.session_state.get("add_tx_category") not in category_options:
-        st.session_state["add_tx_category"] = category_options[0]
-
-    middle_row = st.columns([1, 1])
-    amount = middle_row[0].number_input(
-        "Amount",
-        min_value=0.0,
-        step=100.0,
-        format="%.2f",
-        key="add_tx_amount",
-    )
-    selected_category = middle_row[1].selectbox(
-        "Category",
-        category_options,
-        key="add_tx_category",
-    )
-
-    custom_category = st.text_input("Custom category (optional)", key="add_tx_custom_category")
-    notes = st.text_area(
-        "Notes",
-        placeholder="Add a short note like dinner, fuel refill, or salary credit",
-        key="add_tx_notes",
-    )
-    submitted = st.button("+ Save Transaction", use_container_width=True, key="add_tx_submit")
-
-    if not submitted:
-        return
-
-    if amount <= 0:
-        st.error("Please enter an amount greater than 0.")
-        return
-
-    category = custom_category if custom_category.strip() else selected_category
-    if category == ADD_CUSTOM_OPTION:
-        st.error("Please enter a custom category name.")
-        return
-
-    category = add_category_for_user(user["id"], transaction_type, category)
-    add_transaction(user["id"], transaction_date, transaction_type, category, amount, notes)
-    st.session_state["flash_message"] = f"{TYPE_LABELS[transaction_type]} saved successfully."
-    for key in ["add_tx_amount", "add_tx_category", "add_tx_custom_category", "add_tx_notes"]:
-        st.session_state.pop(key, None)
-    set_active_section("Add")
-    st.rerun()
-
-
-def render_category_manager(user: dict[str, Any]) -> None:
-    st.subheader("Categories")
-    st.caption("Keep your categories tidy so every transaction is easy to understand later.")
-
-    with st.form("add_category_form", clear_on_submit=True):
-        category_row = st.columns([1, 1])
-        category_type_label = category_row[0].selectbox("Category type", list(TYPE_LABELS.values()))
-        category_type = category_type_label.lower()
-        new_category = category_row[1].text_input("New category")
-        add_category_clicked = st.form_submit_button("+ Add Category", use_container_width=True)
-
-    if add_category_clicked:
-        if not new_category.strip():
-            st.error("Please enter a category name.")
-        else:
-            category = add_category_for_user(user["id"], category_type, new_category)
-            st.session_state["flash_message"] = f"Category '{category}' added."
-            set_active_section("Settings")
-            st.rerun()
-
-    categories = get_categories_for_user(user["id"])
-    for transaction_type, label in TYPE_LABELS.items():
-        chip_markup = "".join(
-            f"<span class='chip'>{html.escape(category)}</span>"
-            for category in categories[transaction_type]
-        )
-        st.markdown(f"**{label} categories**")
-        st.markdown(f"<div class='chip-row'>{chip_markup}</div>", unsafe_allow_html=True)
-
-
-def render_metrics(filtered_transactions: pd.DataFrame) -> None:
-    st.subheader("Filtered Summary")
-    totals = summarize_totals(filtered_transactions)
-    metric_columns = st.columns(4)
-    metric_columns[0].metric("Total Expenses", format_currency(totals["expense_total"]))
-    metric_columns[1].metric("Total Credits", format_currency(totals["credit_total"]))
-    metric_columns[2].metric("Net Balance", format_currency(totals["net_total"]))
-    metric_columns[3].metric("Transactions", f"{len(filtered_transactions)}")
-
-
-def render_period_stats(transactions: pd.DataFrame) -> None:
-    st.subheader("Daily, Weekly, and Monthly Stats")
-    period_stats = build_period_stats(transactions)
-    if period_stats.empty:
-        st.info("Add transactions to see your daily, weekly, and monthly stats.")
-        return
-
-    columns = st.columns(3)
-    for index, row in period_stats.iterrows():
-        with columns[index]:
-            st.markdown(f"**{row['Period']}**")
-            st.metric("Expenses", format_currency(row["Expenses"]))
-            st.metric("Credits", format_currency(row["Credits"]))
-            st.metric("Net", format_currency(row["Net"]))
-            st.caption(f"Transactions: {int(row['Transactions'])}")
-
-
-def render_pie_chart(filtered_transactions: pd.DataFrame) -> None:
-    st.subheader("Category Pie Chart")
-
-    available_types = []
-    if (filtered_transactions["transaction_type"] == "expense").any():
-        available_types.append("Expense")
-    if (filtered_transactions["transaction_type"] == "credit").any():
-        available_types.append("Credit")
-
-    if not available_types:
-        st.info("Add a few transactions to see the category split.")
-        return
-
-    if st.session_state.get("pie_chart_type") not in available_types:
-        st.session_state["pie_chart_type"] = available_types[0]
-
-    chart_type = st.radio(
-        "Show pie chart for",
-        available_types,
-        horizontal=True,
-        key="pie_chart_type",
-    ).lower()
-
-    pie_data = (
-        filtered_transactions[filtered_transactions["transaction_type"] == chart_type]
-        .groupby("category", as_index=False)["amount"]
-        .sum()
-        .sort_values("amount", ascending=False)
-    )
-
-    pie_chart = (
-        alt.Chart(pie_data, title=f"{TYPE_LABELS[chart_type]} distribution by category")
-        .mark_arc(innerRadius=60)
-        .encode(
-            theta=alt.Theta("amount:Q", stack=True),
-            color=alt.Color("category:N", legend=alt.Legend(title="Category")),
-            tooltip=[
-                alt.Tooltip("category:N", title="Category"),
-                alt.Tooltip("amount:Q", title="Amount", format=",.2f"),
-            ],
-        )
-    )
-    st.altair_chart(pie_chart, use_container_width=True)
-
-
-def render_monthly_trends(filtered_transactions: pd.DataFrame) -> None:
-    st.subheader("Monthly Trends")
-
-    monthly_summary = build_monthly_summary(filtered_transactions)
-    if monthly_summary.empty:
-        st.info("Monthly trends will appear once you add transactions.")
-        return
-
-    trend_data = monthly_summary.melt(
-        id_vars="month",
-        value_vars=["Expense", "Credit", "Net"],
-        var_name="Series",
-        value_name="Amount",
-    )
-    trend_chart = (
-        alt.Chart(trend_data, title="Expenses, credits, and net balance by month")
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("month:T", title="Month"),
-            y=alt.Y("Amount:Q", title="Amount"),
-            color=alt.Color("Series:N", legend=alt.Legend(title="")),
-            tooltip=[
-                alt.Tooltip("month:T", title="Month"),
-                alt.Tooltip("Series:N", title="Series"),
-                alt.Tooltip("Amount:Q", title="Amount", format=",.2f"),
-            ],
-        )
-    )
-    st.altair_chart(trend_chart, use_container_width=True)
-
-    expense_category_trend = filtered_transactions[
-        filtered_transactions["transaction_type"] == "expense"
-    ].copy()
-    if not expense_category_trend.empty:
-        expense_category_trend["month"] = (
-            expense_category_trend["transaction_date"].dt.to_period("M").dt.to_timestamp()
-        )
-        category_chart_data = (
-            expense_category_trend.groupby(["month", "category"], as_index=False)["amount"]
-            .sum()
-            .sort_values(["month", "amount"], ascending=[True, False])
-        )
-        category_chart = (
-            alt.Chart(category_chart_data, title="Monthly expense trend by category")
-            .mark_bar()
-            .encode(
-                x=alt.X("month:T", title="Month"),
-                y=alt.Y("amount:Q", title="Amount", stack=True),
-                color=alt.Color("category:N", legend=alt.Legend(title="Category")),
-                tooltip=[
-                    alt.Tooltip("month:T", title="Month"),
-                    alt.Tooltip("category:N", title="Category"),
-                    alt.Tooltip("amount:Q", title="Amount", format=",.2f"),
-                ],
-            )
-        )
-        st.altair_chart(category_chart, use_container_width=True)
-
-    monthly_table = monthly_summary.copy()
-    monthly_table["Month"] = monthly_table["month"].dt.strftime("%b %Y")
-    monthly_table = monthly_table[["Month", "Expense", "Credit", "Net"]]
-    st.dataframe(
-        monthly_table,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Expense": st.column_config.NumberColumn(format="%.2f"),
-            "Credit": st.column_config.NumberColumn(format="%.2f"),
-            "Net": st.column_config.NumberColumn(format="%.2f"),
-        },
-    )
-
-
-def render_transactions_table(filtered_transactions: pd.DataFrame, user: dict[str, Any]) -> None:
-    st.subheader("Transactions")
-    if filtered_transactions.empty:
-        st.info("No transactions match the selected filters.")
-        return
-
-    table_data = filtered_transactions.copy()
-    table_data["Date"] = table_data["transaction_date"].dt.strftime("%d %b %Y")
-    table_data["Type"] = table_data["transaction_type"].str.title()
-    table_data["Amount"] = table_data["amount"]
-    table_data["Category"] = table_data["category"]
-    table_data["Notes"] = table_data["notes"]
-
-    render_recent_transactions_cards(filtered_transactions, limit=8)
-
-    with st.expander("Open full table", expanded=False):
-        st.dataframe(
-            table_data[["Date", "Type", "Category", "Amount", "Notes"]],
-            use_container_width=True,
-            hide_index=True,
-            column_config={"Amount": st.column_config.NumberColumn(format="%.2f")},
-        )
-
-    all_transactions = get_transactions_for_user(user["id"])
-    with st.expander("Import / Export CSV", expanded=False):
-        export_columns = st.columns(3)
-        export_columns[0].download_button(
-            "Download filtered CSV",
-            data=build_transactions_csv(filtered_transactions),
-            file_name="filtered_transactions.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-        export_columns[1].download_button(
-            "Download all CSV",
-            data=build_transactions_csv(all_transactions),
-            file_name="all_transactions.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-        export_columns[2].download_button(
-            "Download template",
-            data=build_transaction_template_csv(),
-            file_name="transactions_template.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-        st.caption(
-            "Template columns: `date`, `type`, `category`, `amount`, `notes`. Use `expense` or `credit` for the type."
-        )
-        uploaded_csv = st.file_uploader(
-            "Upload transactions CSV",
-            type=["csv"],
-            key="transactions_csv_upload",
-            help="Upload a CSV using the provided template or the same column format.",
-        )
-        if st.button("Upload Transactions CSV", use_container_width=True):
-            if uploaded_csv is None:
-                st.error("Choose a CSV file first.")
-            else:
-                success, message = import_transactions_csv(user["id"], uploaded_csv)
-                if success:
-                    st.session_state["flash_message"] = message
-                    set_active_section("Transactions")
+        with manage_right:
+            st.markdown("#### Remove user")
+            current_user = normalize_username(st.session_state.get("auth_user", ""))
+            delete_candidates = [user for user in users_df["username"].tolist() if user != current_user] if not users_df.empty else []
+            delete_options = delete_candidates if delete_candidates else ["No removable users"]
+            with st.form("dev_user_delete_form"):
+                user_to_delete = st.selectbox(
+                    "Select user",
+                    options=delete_options,
+                    disabled=not delete_candidates,
+                )
+                delete_user_clicked = st.form_submit_button("Delete User", width="stretch", disabled=not delete_candidates)
+            if delete_user_clicked:
+                try:
+                    delete_auth_user(user_to_delete, st.session_state.get("auth_user", ""))
+                    log_activity("User Management", "Delete User", f"Deleted user `{user_to_delete}`.")
+                    st.success(f"User `{user_to_delete}` deleted.")
                     st.rerun()
-                st.error(message)
+                except Exception as e:
+                    st.error(str(e))
 
-    st.markdown("#### Delete Transactions")
-    st.caption("Tick one or more entries below, then confirm removal.")
-    selected_ids: list[int] = []
-    with st.expander("Select transactions to remove", expanded=False):
-        for _, row in filtered_transactions.iterrows():
-            label = (
-                f"{row['transaction_date'].strftime('%d %b %Y')} | "
-                f"{str(row['transaction_type']).title()} | "
-                f"{row['category']} | "
-                f"{format_transaction_amount(float(row['amount']), str(row['transaction_type']))}"
+    with console_tabs[1]:
+        activity_df = activity_log_df()
+        if activity_df.empty:
+            st.caption("No user activity has been recorded yet.")
+        else:
+            summary_df = (
+                activity_df.groupby("category", as_index=False)
+                .agg(events=("action", "count"), latest=("timestamp", "max"))
+                .sort_values(by=["events", "category"], ascending=[False, True])
             )
-            is_selected = st.checkbox(label, key=f"tx_delete_{int(row['id'])}")
-            if is_selected:
-                selected_ids.append(int(row["id"]))
-            if str(row["notes"]).strip():
-                st.caption(f"Note: {row['notes']}")
 
-    confirm_delete_transaction = st.checkbox("Confirm selected transaction delete")
-    if st.button("- Remove Selected Transactions", use_container_width=True):
-        if not selected_ids:
-            st.error("Select at least one transaction.")
-        elif not confirm_delete_transaction:
-            st.error("Please confirm the delete action first.")
+            top_a, top_b, top_c = st.columns(3)
+            with top_a:
+                st.metric("Activity events", int(len(activity_df)))
+            with top_b:
+                st.metric("Categories", int(summary_df.shape[0]))
+            with top_c:
+                st.metric("Latest event", str(activity_df.iloc[0]["timestamp"]))
+
+            st.markdown("#### Activity by category")
+            st.dataframe(summary_df, width="stretch", hide_index=True)
+
+            category_order = ["Authentication", "User Management", "Inputs", "Rota", "Maintenance"]
+            available_categories = [category for category in category_order if category in activity_df["category"].tolist()]
+            remaining_categories = sorted([category for category in activity_df["category"].unique().tolist() if category not in available_categories])
+            activity_tabs = st.tabs(["All Activity"] + available_categories + remaining_categories)
+
+            with activity_tabs[0]:
+                st.dataframe(activity_df, width="stretch", hide_index=True)
+
+            for tab_index, category in enumerate(available_categories + remaining_categories, start=1):
+                with activity_tabs[tab_index]:
+                    category_df = activity_df[activity_df["category"] == category].reset_index(drop=True)
+                    st.dataframe(category_df, width="stretch", hide_index=True)
+
+    with console_tabs[2]:
+        st.markdown("#### Manual ROTA upload")
+        st.caption("Upload a completed rota file to create or replace the saved snapshot. The upload should follow the provided full-shift template.")
+
+        if end_date < start_date:
+            st.error("End date must be on or after start date before a manual rota can be uploaded.")
         else:
-            delete_transactions(selected_ids, user["id"])
-            st.session_state["flash_message"] = "Selected transactions deleted successfully."
-            set_active_section("Transactions")
-            st.rerun()
+            try:
+                members = parse_members(team_df)
+                valid_names = {member.name for member in members}
+                current_sync_groups = parse_sync_groups(sync_groups_df, valid_names)
+                manual_dates = dates_in_range(start_date, end_date)
+                manual_bank_holidays = resolve_selected_bank_holidays(
+                    start_date,
+                    end_date,
+                    bank_holiday_mode,
+                    auto_bank_holiday_days,
+                    specific_bank_holiday_df,
+                )
+                template_df = build_manual_rota_template_df(members, manual_dates, current_sync_groups)
+                template_bytes = manual_rota_template_bytes(template_df, start_date, end_date)
 
-    if st.button("+ Add Transaction", use_container_width=True):
-        set_active_section("Add")
-        st.rerun()
-
-
-def render_admin_panel(current_user: dict[str, Any]) -> None:
-    if current_user["role"] != "developer":
-        return
-
-    st.subheader("Developer Admin")
-    st.caption("Manage users, recaps, SMTP settings, and notification history from one place.")
-
-    admin_section = render_section_navigation(
-        ["Users", "Recaps", "SMTP", "Notifications"],
-        ADMIN_SECTION_KEY,
-    )
-
-    users_df = list_users()
-
-    if admin_section == "Users":
-        if users_df.empty:
-            st.info("No users available yet.")
-        else:
-            display_df = users_df.copy()
-            display_df["created_at"] = pd.to_datetime(display_df["created_at"], errors="coerce")
-            if "last_login_at" in display_df:
-                display_df["last_login_at"] = pd.to_datetime(display_df["last_login_at"], errors="coerce")
-
-            with st.expander("+ Add User", expanded=False):
-                with st.form("developer_add_user_form", clear_on_submit=True):
-                    new_full_name = st.text_input("Full name", key="dev_new_full_name")
-                    new_username = st.text_input("Username", key="dev_new_username")
-                    new_email = st.text_input("Email", key="dev_new_email")
-                    new_password = st.text_input("Password", type="password", key="dev_new_password")
-                    create_user_clicked = st.form_submit_button("+ Create User", use_container_width=True)
-
-                if create_user_clicked:
-                    success, message = create_user(new_full_name, new_username, new_email, new_password)
-                    if success:
-                        st.success(message)
-                        set_active_section("Developer Admin", "Users")
-                        st.rerun()
-                    st.error(message)
-
-            st.markdown("#### Select Users")
-            st.caption("Tick users to manage them. Delete works on all selected rows.")
-            selected_user_ids: list[int] = []
-            for _, row in display_df.iterrows():
-                username = html.escape(str(row["username"]))
-                full_name = html.escape(str(row["full_name"]))
-                email = html.escape(str(row["email"]))
-                role = html.escape(str(row["role"]).title())
-                status = "Active" if bool(row["is_active"]) else "Disabled"
-                checkbox_label = f"{row['username']} | {row['email']} | {row['role']}"
-                checked = st.checkbox(checkbox_label, key=f"user_pick_{int(row['id'])}")
-                st.caption(f"{full_name} | {email} | {role} | {status}")
-                if checked:
-                    selected_user_ids.append(int(row["id"]))
-
-            selected_user = get_user_by_id(selected_user_ids[0]) if selected_user_ids else None
-            if len(selected_user_ids) > 1:
-                st.caption("Using the first selected user for reset and role changes.")
-
-            with st.expander("Open user table", expanded=False):
-                st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-            if selected_user:
-                st.markdown(f"#### Selected user: `{selected_user['username']}`")
-                if selected_user["id"] != current_user["id"]:
-                    status_columns = st.columns([1, 1])
-                    desired_role = status_columns[0].selectbox(
-                        "Role",
-                        ["user", "developer"],
-                        index=0 if selected_user["role"] == "user" else 1,
+                upload_col, template_col = st.columns([1.6, 1])
+                with upload_col:
+                    uploaded_manual_rota = st.file_uploader(
+                        "Upload manual rota file",
+                        type=["xlsx", "xls", "csv"],
+                        accept_multiple_files=False,
+                        key="manual_rota_upload",
+                        help="Use the template and fill every date cell with Morning, Afternoon, Night, Week Off, Leave, or M/A/N/WO/L.",
                     )
-                    desired_status = status_columns[1].selectbox(
-                        "Status",
-                        ["active", "disabled"],
-                        index=0 if selected_user["is_active"] else 1,
+                with template_col:
+                    st.download_button(
+                        "Download Manual ROTA Template",
+                        data=template_bytes,
+                        file_name=f"manual_rota_template_{start_date.isoformat()}_{end_date.isoformat()}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        width="stretch",
                     )
-                    if st.button("Save Role and Status", use_container_width=True):
-                        update_user_role(selected_user["id"], desired_role)
-                        update_user_status(selected_user["id"], desired_status == "active")
-                        st.session_state["flash_message"] = f"Updated user '{selected_user['username']}'."
-                        set_active_section("Developer Admin", "Users")
-                        st.rerun()
-                else:
-                    st.info("The active developer account cannot be role-edited or deleted from this screen.")
 
-                reset_columns = st.columns([1, 1])
-                with reset_columns[0]:
-                    reset_password_value = st.text_input(
-                        "New password",
-                        type="password",
-                        key=f"reset_password_{selected_user['id']}",
-                    )
-                    if st.button("Reset Password", key=f"btn_reset_password_{selected_user['id']}", use_container_width=True):
-                        if selected_user["id"] == current_user["id"]:
-                            st.error("Reset the developer password through environment variables or a dedicated secure flow.")
-                        elif not reset_password_value.strip():
-                            st.error("Enter a new password to reset.")
-                        else:
-                            reset_user_password(selected_user["id"], reset_password_value)
-                            st.success(
-                                f"Password reset for {selected_user['username']}. "
-                                f"New temporary password: {reset_password_value}"
+                st.dataframe(template_df.head(min(5, len(template_df))), width="stretch", hide_index=True)
+
+                if uploaded_manual_rota is not None:
+                    try:
+                        uploaded_manual_df = read_uploaded_rota_sheet(uploaded_manual_rota)
+                        parsed_manual_rota_df = parse_manual_rota_upload_df(
+                            uploaded_manual_df,
+                            members,
+                            manual_dates,
+                            current_sync_groups,
+                        )
+                        st.success(f"Validated manual rota file `{uploaded_manual_rota.name}` for {len(parsed_manual_rota_df)} members.")
+                        st.dataframe(parsed_manual_rota_df.head(min(8, len(parsed_manual_rota_df))), width="stretch", hide_index=True)
+
+                        if st.button("Save Uploaded ROTA", type="primary", width="stretch"):
+                            save_inputs(team_df, leaves_df, specific_bank_holiday_df, sync_groups_df)
+                            metadata = {
+                                "start_date": start_date.isoformat(),
+                                "end_date": end_date.isoformat(),
+                            }
+                            updated_bundle = save_manual_uploaded_rota(parsed_manual_rota_df, metadata, manual_bank_holidays)
+                            st.session_state["rota_bundle"] = updated_bundle
+                            log_activity(
+                                "Rota",
+                                "Manual Rota Upload",
+                                f"Uploaded manual rota from `{uploaded_manual_rota.name}` for {start_date.isoformat()} to {end_date.isoformat()}.",
                             )
+                            st.success("Manual rota uploaded and saved to the database.")
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not load the uploaded rota: {e}")
+            except Exception as e:
+                st.error(f"Manual rota upload is unavailable until the team and sync-group data are valid: {e}")
 
-                with reset_columns[1]:
-                    confirm_reset_data = st.checkbox(
-                        "Confirm account data reset",
-                        key=f"confirm_data_reset_{selected_user['id']}",
-                    )
-                    if st.button("Reset Account Data", key=f"btn_reset_data_{selected_user['id']}", use_container_width=True):
-                        if selected_user["id"] == current_user["id"]:
-                            st.error("You cannot reset the active developer account data from here.")
-                        elif not confirm_reset_data:
-                            st.error("Confirm data reset first.")
-                        else:
-                            reset_user_account_data(selected_user["id"])
-                            st.success(f"Account data reset for {selected_user['username']}.")
+    with console_tabs[3]:
+        render_section_header("DB", "Storage And Maintenance", "Inspect saved state and use a few safe maintenance actions for local development.")
+        state_df = app_state_summary_df()
+        if state_df.empty:
+            st.caption("No database-backed state entries were found yet.")
+        else:
+            st.dataframe(state_df, width="stretch", hide_index=True)
 
-            confirm_delete = st.checkbox("Confirm selected user delete", key="confirm_delete_selected_users")
-            if st.button("- Remove Selected Users", key="btn_delete_selected_users", use_container_width=True):
-                if not selected_user_ids:
-                    st.error("Select at least one user.")
-                elif not confirm_delete:
-                    st.error("Confirm delete first.")
+        tools_left, tools_middle, tools_right = st.columns(3)
+        with tools_left:
+            if st.button("Clear Saved ROTA Snapshot", width="stretch"):
+                delete_state(STATE_KEY_ROTA)
+                if ROTA_EXCEL_FILE.exists():
+                    ROTA_EXCEL_FILE.unlink()
+                if ROTA_CSV_FILE.exists():
+                    ROTA_CSV_FILE.unlink()
+                st.session_state["rota_bundle"] = None
+                log_activity("Maintenance", "Clear Saved ROTA Snapshot", "Deleted the saved rota snapshot and local rota exports.")
+                st.success("Saved rota snapshot cleared from the database and local exports.")
+                st.rerun()
+        with tools_middle:
+            if st.button("Clear Team Import Draft", width="stretch"):
+                st.session_state["team_import_df"] = None
+                log_activity("Maintenance", "Clear Team Import Draft", "Cleared the current team import draft from the session.")
+                st.success("Team import draft cleared from the current session.")
+        with tools_right:
+            if st.button("Restore Default Users", width="stretch"):
+                save_auth_users({username: dict(config) for username, config in DEFAULT_AUTH_USERS.items()})
+                current_user = normalize_username(st.session_state.get("auth_user", ""))
+                if current_user in DEFAULT_AUTH_USERS:
+                    st.session_state["auth_role"] = DEFAULT_AUTH_USERS[current_user]["role"]
                 else:
-                    protected_ids = {current_user["id"]}
-                    removable_ids = [user_id for user_id in selected_user_ids if user_id not in protected_ids]
-                    if not removable_ids:
-                        st.error("You cannot delete the active developer account.")
-                    else:
-                        for removable_id in removable_ids:
-                            delete_user_account(removable_id)
-                        st.success(f"Deleted {len(removable_ids)} selected user(s).")
-                        set_active_section("Developer Admin", "Users")
-                        st.rerun()
+                    logout_user()
+                log_activity("Maintenance", "Restore Default Users", "Restored the default local user accounts.")
+                st.success("Default users restored.")
+                st.rerun()
 
-    if admin_section == "Recaps":
-        recap_candidates = users_df[users_df["role"] != "developer"]["username"].tolist() if not users_df.empty else []
-        if not recap_candidates:
-            st.info("No non-developer users available for recap delivery.")
-        else:
-            recap_username = st.selectbox("Send monthly recap to user", recap_candidates, key="recap_user")
-            recap_month = st.date_input(
-                "Recap month",
-                value=(pd.Timestamp.today().replace(day=1) - pd.DateOffset(months=1)).date(),
-                key="recap_month",
-            )
-            if st.button("Send Monthly Recap Now", use_container_width=True):
-                recap_user = get_user_by_username(recap_username)
-                recap_start = pd.Timestamp(recap_month).replace(day=1)
-                if recap_user:
-                    sent, message = send_monthly_recap_email(recap_user, recap_start)
-                    if sent:
-                        st.success(f"Monthly recap sent to {recap_user['email']}.")
-                    else:
-                        st.error(f"Monthly recap failed: {message}")
 
-    if admin_section == "SMTP":
-        st.markdown("#### SMTP Settings")
-        st.caption(
-            "These settings are stored locally in the app database. Environment variables still override them if present."
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="ROTA Generator", layout="wide")
+init_auth_state()
+
+st.markdown(
+    """
+    <style>
+    :root {
+        --bg: #05070b;
+        --bg-elevated: #0b1018;
+        --surface: rgba(15, 22, 36, 0.96);
+        --surface-soft: rgba(18, 28, 44, 0.94);
+        --surface-muted: rgba(24, 37, 57, 0.92);
+        --surface-strong: rgba(28, 43, 66, 0.98);
+        --border: rgba(126, 154, 199, 0.16);
+        --border-strong: rgba(117, 190, 241, 0.34);
+        --text: #eef4ff;
+        --text-strong: #ffffff;
+        --muted: #9caecc;
+        --muted-strong: #c7d6eb;
+        --accent: #6dd5ff;
+        --accent-strong: #2daee5;
+        --accent-soft: rgba(109, 213, 255, 0.14);
+        --accent-soft-strong: rgba(109, 213, 255, 0.22);
+        --sidebar: rgba(8, 12, 20, 0.96);
+        --success-soft: rgba(38, 179, 118, 0.14);
+        --warning-soft: rgba(214, 141, 39, 0.14);
+        --danger-soft: rgba(220, 91, 116, 0.14);
+        --shadow-xs: 0 8px 22px rgba(0, 0, 0, 0.22);
+        --shadow-sm: 0 20px 44px rgba(0, 0, 0, 0.30);
+        --shadow-md: 0 30px 72px rgba(0, 0, 0, 0.38);
+        --radius-lg: 22px;
+        --radius-md: 16px;
+        --radius-sm: 12px;
+        --radius-xl: 28px;
+        --btn-primary-top: #69d9ff;
+        --btn-primary-bottom: #1d8fcf;
+        --btn-primary-border: rgba(123, 223, 255, 0.58);
+        --btn-secondary-bg: rgba(16, 24, 38, 0.92);
+        --btn-secondary-border: rgba(135, 166, 204, 0.26);
+        --btn-secondary-hover: rgba(22, 34, 53, 0.96);
+        --focus-ring: rgba(109, 213, 255, 0.20);
+        --grid-bg-cell: #0f1724;
+        --grid-bg-cell-medium: #132031;
+        --grid-bg-header: #18273a;
+        --grid-bg-header-focus: #1e324a;
+        --grid-border: #24364d;
+        --grid-border-soft: #1a2a3e;
+        --grid-text-dark: #eef4ff;
+        --grid-text-medium: #a0b4d0;
+        --grid-accent: #58cbff;
+        --grid-accent-light: rgba(88, 203, 255, 0.16);
+    }
+    html, body, [class*="css"]  {
+        font-family: "Avenir Next", "Segoe UI Variable", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    }
+    html, body {
+        background: var(--bg);
+        color: var(--text);
+    }
+    .stApp {
+        position: relative;
+        min-height: 100vh;
+        overflow: hidden;
+        background: linear-gradient(180deg, #06080d 0%, #05070b 56%, #071019 100%);
+        color: var(--text);
+    }
+    .stApp::before {
+        content: "";
+        position: fixed;
+        top: -10rem;
+        right: -12rem;
+        width: 44rem;
+        height: 44rem;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(43, 171, 228, 0.18) 0%, rgba(43, 171, 228, 0.06) 35%, transparent 72%);
+        filter: blur(20px);
+        pointer-events: none;
+        z-index: 0;
+        animation: drift-one 18s ease-in-out infinite alternate;
+    }
+    .stApp::after {
+        content: "";
+        position: fixed;
+        bottom: -14rem;
+        left: -12rem;
+        width: 40rem;
+        height: 40rem;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(47, 215, 185, 0.15) 0%, rgba(47, 215, 185, 0.05) 36%, transparent 72%);
+        filter: blur(28px);
+        pointer-events: none;
+        z-index: 0;
+        animation: drift-two 24s ease-in-out infinite alternate;
+    }
+    .stApp:has(.page-state-logged-out) {
+        background: #050608;
+    }
+    .stApp:has(.page-state-logged-out)::before,
+    .stApp:has(.page-state-logged-out)::after {
+        display: none;
+    }
+    .stApp:has(.page-state-logged-out) [data-testid="stForm"] {
+        background: linear-gradient(180deg, rgba(13, 20, 32, 0.98) 0%, rgba(17, 27, 42, 0.95) 100%);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        padding: 0.35rem 1rem 1rem 1rem;
+        box-shadow: var(--shadow-sm);
+    }
+    [data-testid="stAppViewContainer"] {
+        background: transparent;
+    }
+    .main .block-container {
+        position: relative;
+        z-index: 1;
+        max-width: 1360px;
+        padding-top: 1.25rem;
+        padding-bottom: 3.25rem;
+    }
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, rgba(8, 12, 20, 0.98) 0%, rgba(9, 14, 23, 0.94) 100%);
+        border-right: 1px solid var(--border);
+        backdrop-filter: blur(18px);
+    }
+    [data-testid="stSidebar"] > div {
+        padding-top: 0.6rem;
+    }
+    .page-state-logged-in,
+    .page-state-logged-out {
+        position: absolute;
+        width: 0;
+        height: 0;
+        overflow: hidden;
+        opacity: 0;
+        pointer-events: none;
+    }
+    .page-hero,
+    .section-banner,
+    .inline-note,
+    .login-panel {
+        background: linear-gradient(180deg, rgba(15, 22, 36, 0.97) 0%, rgba(18, 28, 44, 0.94) 100%);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        padding: 1.15rem 1.35rem;
+        margin-bottom: 0.95rem;
+        box-shadow: var(--shadow-sm);
+        backdrop-filter: blur(16px);
+        animation: card-in 420ms ease both;
+    }
+    .page-hero {
+        position: relative;
+        overflow: hidden;
+        padding: 1.45rem 1.55rem;
+        margin-bottom: 0.95rem;
+        background:
+            linear-gradient(135deg, rgba(74, 198, 255, 0.16), transparent 26%),
+            linear-gradient(180deg, rgba(12, 18, 29, 0.98) 0%, rgba(16, 25, 40, 0.96) 100%);
+        box-shadow: var(--shadow-md);
+    }
+    .page-hero::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background:
+            linear-gradient(110deg, rgba(255, 255, 255, 0.08), transparent 42%),
+            radial-gradient(circle at top right, rgba(109, 213, 255, 0.10), transparent 28%);
+        pointer-events: none;
+        z-index: 0;
+    }
+    .page-hero > *,
+    .section-banner > *,
+    .inline-note > * {
+        position: relative;
+        z-index: 1;
+    }
+    .page-hero-title,
+    .section-title,
+    .inline-note-title {
+        color: var(--text-strong) !important;
+        font-weight: 700;
+    }
+    .page-hero-kicker,
+    .section-index {
+        display: inline-block;
+        font-size: 0.72rem;
+        font-weight: 800;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        color: var(--accent);
+    }
+    .page-hero-kicker {
+        padding: 0.36rem 0.68rem;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        border: 1px solid rgba(121, 222, 255, 0.22);
+    }
+    .page-hero-title,
+    .login-heading {
+        font-size: 2.05rem;
+        line-height: 1.06;
+        margin: 0.7rem 0 0.4rem 0;
+        letter-spacing: -0.03em;
+    }
+    .section-title {
+        font-size: 1.1rem;
+        margin: 0;
+        letter-spacing: -0.02em;
+    }
+    .page-hero-copy,
+    .section-copy,
+    .login-subcopy,
+    .inline-note-copy {
+        color: var(--muted) !important;
+        line-height: 1.6;
+    }
+    .page-hero-copy {
+        max-width: 48rem;
+        font-size: 0.98rem;
+    }
+    .hero-badges {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.55rem;
+        margin-top: 0.95rem;
+    }
+    .hero-badge {
+        background: rgba(109, 213, 255, 0.11);
+        border: 1px solid rgba(109, 213, 255, 0.18);
+        border-radius: 999px;
+        color: #dff6ff;
+        padding: 0.38rem 0.78rem;
+        font-size: 0.84rem;
+        font-weight: 600;
+    }
+    .login-shell {
+        padding-top: min(14vh, 6rem);
+    }
+    .login-panel {
+        max-width: 34rem;
+        margin: 0 auto 1rem auto;
+        padding: 1.5rem 1.6rem 1.25rem 1.6rem;
+        border-radius: var(--radius-xl);
+        border-color: var(--border-strong);
+        box-shadow: 0 28px 80px rgba(0, 0, 0, 0.42);
+        text-align: center;
+    }
+    .login-eyebrow {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.4rem;
+        padding: 0.34rem 0.8rem;
+        border-radius: 999px;
+        background: rgba(109, 213, 255, 0.11);
+        border: 1px solid rgba(109, 213, 255, 0.22);
+        color: var(--accent);
+        font-size: 0.73rem;
+        font-weight: 800;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+    }
+    .login-heading {
+        color: var(--text-strong) !important;
+    }
+    .login-subcopy {
+        margin: 0;
+        text-align: center;
+        font-size: 0.97rem;
+    }
+    .section-banner {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        grid-template-rows: auto auto;
+        column-gap: 0.9rem;
+        row-gap: 0.25rem;
+        align-items: start;
+        padding: 1rem 1.15rem;
+        background: linear-gradient(180deg, rgba(14, 21, 33, 0.98) 0%, rgba(17, 27, 42, 0.95) 100%);
+    }
+    .section-index {
+        grid-row: 1 / span 2;
+        min-width: 2.25rem;
+        text-align: center;
+        padding: 0.28rem 0.2rem 0.15rem 0.2rem;
+        border-radius: 999px;
+        background: rgba(109, 213, 255, 0.10);
+        border: 1px solid rgba(109, 213, 255, 0.18);
+    }
+    .section-copy {
+        grid-column: 2;
+        font-size: 0.93rem;
+    }
+    .inline-note {
+        position: relative;
+        padding: 0.95rem 1rem 0.95rem 1.1rem;
+        background: linear-gradient(180deg, rgba(14, 21, 33, 0.98) 0%, rgba(20, 33, 50, 0.95) 100%);
+    }
+    .inline-note::before {
+        content: "";
+        position: absolute;
+        left: 0;
+        top: 0;
+        bottom: 0;
+        width: 4px;
+        border-radius: 22px 0 0 22px;
+        background: var(--accent);
+    }
+    .inline-note-info {
+        background:
+            linear-gradient(180deg, rgba(14, 21, 33, 0.98) 0%, rgba(15, 29, 41, 0.95) 100%),
+            var(--accent-soft);
+    }
+    .inline-note-warning {
+        background:
+            linear-gradient(180deg, rgba(14, 21, 33, 0.98) 0%, rgba(32, 25, 18, 0.95) 100%),
+            var(--warning-soft);
+    }
+    .inline-note-warning::before {
+        background: #cf8a18;
+    }
+    body {
+        color: var(--text);
+    }
+    h1, h2, h3, h4, h5, h6 {
+        color: var(--text-strong) !important;
+        letter-spacing: -0.02em;
+    }
+    label {
+        color: var(--muted-strong) !important;
+    }
+    [data-testid="stMarkdownContainer"] p,
+    [data-testid="stMarkdownContainer"] li,
+    [data-testid="stCaptionContainer"],
+    .stCaption {
+        color: var(--muted) !important;
+    }
+    [data-testid="stSidebar"] h1,
+    [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h3,
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] div,
+    [data-testid="stSidebar"] span {
+        color: var(--text);
+    }
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+        color: var(--muted);
+        line-height: 1.55;
+    }
+    [data-testid="stSidebar"] .stAlert {
+        border-radius: var(--radius-md);
+    }
+    [data-testid="stSidebar"] .stButton button,
+    [data-testid="stSidebar"] .stDownloadButton button,
+    [data-testid="stSidebar"] .stFormSubmitButton button {
+        min-height: 2.55rem;
+    }
+    [data-testid="stMarkdownContainer"] a {
+        color: var(--accent);
+        text-decoration: none;
+    }
+    [data-testid="stMarkdownContainer"] a:hover {
+        text-decoration: underline;
+    }
+    [data-testid="stForm"] {
+        background: transparent;
+        border: none;
+        box-shadow: none;
+    }
+    .stButton button,
+    .stDownloadButton button,
+    .stFormSubmitButton button {
+        background: linear-gradient(180deg, var(--btn-primary-top) 0%, var(--btn-primary-bottom) 100%);
+        color: #03111a;
+        border: 1px solid var(--btn-primary-border);
+        border-radius: var(--radius-sm);
+        min-height: 2.75rem;
+        font-weight: 700;
+        letter-spacing: 0.01em;
+        box-shadow: 0 14px 28px rgba(21, 126, 172, 0.24);
+        transition: transform 160ms ease, box-shadow 180ms ease, border-color 180ms ease, background 180ms ease;
+    }
+    .stButton button:hover,
+    .stDownloadButton button:hover,
+    .stFormSubmitButton button:hover {
+        transform: translateY(-2px);
+        border-color: rgba(158, 234, 255, 0.72);
+        background: linear-gradient(180deg, #82e1ff 0%, #31ace3 100%);
+        box-shadow: 0 18px 34px rgba(21, 126, 172, 0.28);
+        color: #021018;
+    }
+    .stButton button:focus,
+    .stDownloadButton button:focus,
+    .stFormSubmitButton button:focus {
+        box-shadow: 0 0 0 0.22rem var(--focus-ring), 0 14px 28px rgba(21, 126, 172, 0.24);
+    }
+    .stButton button[kind="secondary"],
+    .stDownloadButton button[kind="secondary"] {
+        background: var(--btn-secondary-bg);
+        color: var(--text);
+        border-color: var(--btn-secondary-border);
+        box-shadow: var(--shadow-xs);
+    }
+    .stButton button[kind="secondary"]:hover,
+    .stDownloadButton button[kind="secondary"]:hover {
+        background: var(--btn-secondary-hover);
+        border-color: rgba(141, 193, 229, 0.38);
+        color: var(--text-strong);
+    }
+    div[data-baseweb="input"] > div,
+    div[data-baseweb="base-input"] > div,
+    div[data-baseweb="select"] > div,
+    div[data-testid="stDateInput"] > div > div,
+    div[data-testid="stTimeInput"] > div > div,
+    div[data-testid="stNumberInput"] > div > div,
+    textarea {
+        background: rgba(10, 16, 26, 0.92) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: var(--radius-sm) !important;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+        transition: border-color 180ms ease, box-shadow 180ms ease, transform 180ms ease;
+    }
+    div[data-baseweb="input"] > div:hover,
+    div[data-baseweb="base-input"] > div:hover,
+    div[data-baseweb="select"] > div:hover,
+    div[data-testid="stDateInput"] > div > div:hover,
+    div[data-testid="stTimeInput"] > div > div:hover,
+    div[data-testid="stNumberInput"] > div > div:hover {
+        border-color: rgba(123, 197, 237, 0.38) !important;
+    }
+    div[data-baseweb="input"] > div:focus-within,
+    div[data-baseweb="base-input"] > div:focus-within,
+    div[data-baseweb="select"] > div:focus-within,
+    div[data-testid="stDateInput"] > div > div:focus-within,
+    div[data-testid="stTimeInput"] > div > div:focus-within,
+    div[data-testid="stNumberInput"] > div > div:focus-within {
+        border-color: rgba(111, 214, 255, 0.46) !important;
+        box-shadow: 0 0 0 0.20rem rgba(109, 213, 255, 0.14);
+        transform: translateY(-1px);
+    }
+    div[data-baseweb="input"] input,
+    div[data-baseweb="base-input"] input,
+    div[data-baseweb="select"] input,
+    textarea {
+        color: var(--text) !important;
+    }
+    div[data-baseweb="select"] span,
+    div[data-baseweb="select"] div {
+        color: var(--text) !important;
+    }
+    textarea::placeholder,
+    input::placeholder {
+        color: #7688a3 !important;
+    }
+    div[role="radiogroup"] {
+        gap: 0.5rem;
+        flex-wrap: wrap;
+    }
+    div[role="radiogroup"] label {
+        background: rgba(15, 22, 36, 0.90);
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 0.24rem 0.78rem;
+        box-shadow: var(--shadow-xs);
+        transition: transform 150ms ease, border-color 150ms ease, background 150ms ease;
+    }
+    div[role="radiogroup"] label:has(input:checked) {
+        border-color: rgba(126, 221, 255, 0.34);
+        background: var(--accent-soft);
+        transform: translateY(-1px);
+    }
+    [data-testid="stDataFrame"],
+    [data-testid="stDataEditor"],
+    [data-testid="stStyledDataFrame"] {
+        background: linear-gradient(180deg, rgba(11, 17, 27, 0.98) 0%, rgba(14, 21, 33, 0.96) 100%);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-md);
+        box-shadow: var(--shadow-sm);
+        overflow: hidden;
+    }
+    [data-testid="stDataFrame"] *,
+    [data-testid="stDataEditor"] *,
+    [data-testid="stStyledDataFrame"] * {
+        color: var(--text);
+    }
+    [data-testid="stDataFrame"],
+    [data-testid="stDataEditor"] {
+        --gdg-bg-cell: var(--grid-bg-cell);
+        --gdg-bg-cell-medium: var(--grid-bg-cell-medium);
+        --gdg-bg-header: var(--grid-bg-header);
+        --gdg-bg-header-has-focus: var(--grid-bg-header-focus);
+        --gdg-border-color: var(--grid-border);
+        --gdg-horizontal-border-color: var(--grid-border-soft);
+        --gdg-text-dark: var(--grid-text-dark);
+        --gdg-text-medium: var(--grid-text-medium);
+        --gdg-accent-color: var(--grid-accent);
+        --gdg-accent-fg: #021219;
+        --gdg-accent-light: var(--grid-accent-light);
+        --gdg-base-font-style: 13px/1.45 "Avenir Next", "Segoe UI Variable", sans-serif;
+        --gdg-header-font-style: 700 12.5px/1.3 "Avenir Next", "Segoe UI Variable", sans-serif;
+    }
+    :root {
+        --gdg-bg-cell: var(--grid-bg-cell);
+        --gdg-bg-cell-medium: var(--grid-bg-cell-medium);
+        --gdg-bg-header: var(--grid-bg-header);
+        --gdg-bg-header-has-focus: var(--grid-bg-header-focus);
+        --gdg-border-color: var(--grid-border);
+        --gdg-horizontal-border-color: var(--grid-border-soft);
+        --gdg-text-dark: var(--grid-text-dark);
+        --gdg-text-medium: var(--grid-text-medium);
+        --gdg-accent-color: var(--grid-accent);
+        --gdg-accent-fg: #021219;
+        --gdg-accent-light: var(--grid-accent-light);
+    }
+    [data-testid="stFileUploader"] small,
+    [data-testid="stFileUploader"] span {
+        color: var(--muted) !important;
+    }
+    div[data-testid="stAlert"] {
+        border-radius: var(--radius-md);
+        border: 1px solid var(--border);
+        box-shadow: var(--shadow-xs);
+        background: linear-gradient(180deg, rgba(15, 22, 36, 0.98) 0%, rgba(18, 28, 44, 0.95) 100%);
+    }
+    div[data-testid="stMetric"] {
+        background: linear-gradient(180deg, rgba(13, 20, 32, 0.98) 0%, rgba(17, 27, 42, 0.95) 100%);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-md);
+        padding: 0.55rem 0.65rem;
+        box-shadow: var(--shadow-sm);
+    }
+    div[data-testid="stMetric"] [data-testid="stMetricLabel"] *,
+    div[data-testid="stMetric"] label {
+        color: var(--muted) !important;
+    }
+    div[data-testid="stMetric"] [data-testid="stMetricValue"] * {
+        color: var(--text-strong) !important;
+    }
+    [data-baseweb="tab-list"] {
+        gap: 0.5rem;
+        border-bottom: 1px solid var(--border);
+        padding: 0 0 0.55rem 0;
+    }
+    [data-baseweb="tab"] {
+        height: 2.55rem;
+        border-radius: 14px 14px 0 0;
+        border: 1px solid transparent;
+        color: var(--muted);
+        font-weight: 600;
+        padding: 0 0.9rem;
+        transition: background 160ms ease, color 160ms ease, transform 160ms ease, border-color 160ms ease;
+    }
+    [data-baseweb="tab"]:hover {
+        background: rgba(17, 27, 42, 0.85);
+        color: var(--text-strong);
+        transform: translateY(-1px);
+    }
+    [data-baseweb="tab"][aria-selected="true"] {
+        background: linear-gradient(180deg, rgba(15, 22, 36, 0.98) 0%, rgba(18, 28, 44, 0.96) 100%);
+        color: var(--accent);
+        border: 1px solid var(--border);
+        border-bottom-color: rgba(15, 22, 36, 0.98);
+        box-shadow: 0 14px 28px rgba(0, 0, 0, 0.18);
+    }
+    [data-testid="stFileUploader"] section {
+        background: linear-gradient(180deg, rgba(12, 18, 29, 0.98) 0%, rgba(15, 24, 38, 0.96) 100%);
+        border: 1px dashed rgba(122, 197, 237, 0.38);
+        border-radius: var(--radius-md);
+        box-shadow: var(--shadow-xs);
+    }
+    [data-testid="stFileUploader"] section:hover {
+        border-color: rgba(145, 219, 255, 0.55);
+        background: linear-gradient(180deg, rgba(13, 21, 33, 0.98) 0%, rgba(17, 27, 42, 0.96) 100%);
+    }
+    [data-testid="stFileUploader"] button {
+        border-radius: var(--radius-sm);
+    }
+    hr,
+    [data-testid="stDivider"] {
+        border-color: var(--border) !important;
+    }
+    ::-webkit-scrollbar {
+        width: 11px;
+        height: 11px;
+    }
+    ::-webkit-scrollbar-track {
+        background: rgba(8, 12, 20, 0.95);
+    }
+    ::-webkit-scrollbar-thumb {
+        background: rgba(128, 156, 198, 0.30);
+        border-radius: 999px;
+        border: 2px solid rgba(8, 12, 20, 0.95);
+    }
+    ::-webkit-scrollbar-thumb:hover {
+        background: rgba(160, 196, 240, 0.40);
+    }
+    @keyframes card-in {
+        from {
+            opacity: 0;
+            transform: translateY(10px);
+        }
+        to {
+            opacity: 1;
+            transform: translateY(0);
+        }
+    }
+    @keyframes drift-one {
+        from {
+            transform: translate3d(0, 0, 0) scale(1);
+        }
+        to {
+            transform: translate3d(-2rem, 1.25rem, 0) scale(1.06);
+        }
+    }
+    @keyframes drift-two {
+        from {
+            transform: translate3d(0, 0, 0) scale(1);
+        }
+        to {
+            transform: translate3d(2rem, -1rem, 0) scale(1.04);
+        }
+    }
+    @media (prefers-reduced-motion: reduce) {
+        .stApp::before,
+        .stApp::after,
+        .page-hero,
+        .section-banner,
+        .inline-note,
+        .login-panel {
+            animation: none !important;
+        }
+        .stButton button,
+        .stDownloadButton button,
+        .stFormSubmitButton button,
+        div[data-baseweb="input"] > div,
+        div[data-baseweb="base-input"] > div,
+        div[data-baseweb="select"] > div,
+        [data-baseweb="tab"],
+        div[role="radiogroup"] label {
+            transition: none !important;
+        }
+    }
+    @media (max-width: 900px) {
+        .main .block-container {
+            padding-top: 1rem;
+        }
+        .page-hero-title,
+        .login-heading {
+            font-size: 1.6rem;
+        }
+        .page-hero,
+        .section-banner,
+        .inline-note,
+        .login-panel {
+            padding: 0.95rem 1rem;
+        }
+        .section-banner {
+            grid-template-columns: 1fr;
+        }
+        .section-index,
+        .section-copy {
+            grid-column: auto;
+            grid-row: auto;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+team_default_df, leaves_default_df, bank_holidays_default_df, sync_groups_default_df = load_inputs()
+saved_rota = load_saved_rota()
+
+leaves_default_df = ensure_date_columns(leaves_default_df, ["leave_start_date", "leave_end_date"])
+bank_holidays_default_df = ensure_date_columns(bank_holidays_default_df, ["bank_holiday_date"])
+
+with st.sidebar:
+    can_manage = st.session_state.get("auth_role") in {"admin", "dev"}
+
+is_logged_in = st.session_state.get("auth_logged_in", False)
+
+if not is_logged_in:
+    st.markdown('<div class="page-state-logged-out"></div>', unsafe_allow_html=True)
+    left, center, right = st.columns([1, 1.35, 1])
+    with center:
+        st.markdown(
+            """
+            <section class="login-shell">
+                <div class="login-panel">
+                    <div class="login-eyebrow">Secure Access</div>
+                    <div class="login-heading">Team ROTA Portal</div>
+                    <div class="login-subcopy">Sign in to continue into the rota workspace.</div>
+                </div>
+            </section>
+            """,
+            unsafe_allow_html=True,
         )
-        smtp_config = get_smtp_config()
-        with st.form("smtp_settings_form"):
-            smtp_host = st.text_input("SMTP host", value=smtp_config["host"])
-            smtp_port = st.text_input("SMTP port", value=smtp_config["port"] or "587")
-            smtp_username = st.text_input("SMTP username", value=smtp_config["username"])
-            smtp_password = st.text_input("SMTP password", value=smtp_config["password"], type="password")
-            smtp_from_email = st.text_input(
-                "From email",
-                value=smtp_config["from_email"] or smtp_config["username"],
-            )
-            save_smtp = st.form_submit_button("Save SMTP Settings", use_container_width=True)
+        with st.form("center_login_form", clear_on_submit=False):
+            username = st.text_input("Username", key="login_username", placeholder="Enter your username")
+            password = st.text_input("Password", type="password", key="login_password", placeholder="Enter your password")
+            login_clicked = st.form_submit_button("Sign In", width="stretch")
+        if login_clicked:
+            if login_user(username, password):
+                st.success(f"Logged in as {st.session_state['auth_role'].title()}.")
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
+    st.stop()
 
-        if save_smtp:
-            save_setting("smtp_host", smtp_host.strip())
-            save_setting("smtp_port", smtp_port.strip())
-            save_setting("smtp_username", smtp_username.strip())
-            save_setting("smtp_password", smtp_password)
-            save_setting("smtp_from_email", smtp_from_email.strip())
-            st.success("SMTP settings saved.")
+st.markdown('<div class="page-state-logged-in"></div>', unsafe_allow_html=True)
 
-    if admin_section == "Notifications":
-        st.markdown("#### Notification Log")
-        notification_df = get_notification_log()
-        if notification_df.empty:
-            st.info("No notifications recorded yet.")
-        else:
-            notification_df["created_at"] = pd.to_datetime(notification_df["created_at"], errors="coerce")
-            st.dataframe(notification_df, use_container_width=True, hide_index=True)
-
-
-def render_user_dashboard(user: dict[str, Any]) -> None:
-    categories = get_categories_for_user(user["id"])
-    transactions = get_transactions_for_user(user["id"])
-
-    header_columns = st.columns([4, 1])
-    with header_columns[0]:
-        render_hero_header(user, transactions)
-    with header_columns[1]:
-        st.write("")
-        st.write("")
-        if st.button("Logout", use_container_width=True):
-            st.session_state.pop("user_id", None)
-            st.rerun()
-
-    flash_message = st.session_state.pop("flash_message", None)
-    if flash_message:
-        st.success(flash_message)
-
-    if transactions.empty:
-        st.info("Add your first expense or credit from the Add tab to populate your dashboard.")
-
-    filtered_transactions = render_filter_panel(transactions)
-
-    if user["role"] == "developer":
-        dashboard_section = render_section_navigation(
-            ["Overview", "Add", "Insights", "Transactions", "Settings", "Developer Admin"],
-            DASHBOARD_SECTION_KEY,
+with st.sidebar:
+    st.header("Access")
+    st.info(f"Current access: {st.session_state['auth_role'].title()} ({st.session_state['auth_user']})")
+    if st.button("Logout", width="stretch"):
+        logout_user()
+        st.rerun()
+    if can_manage:
+        st.divider()
+        st.header("Schedule Setup")
+        start_date = st.date_input("Start date", value=date.today(), disabled=not can_manage)
+        end_date = st.date_input("End date", value=date.today() + timedelta(days=13), disabled=not can_manage)
+        weekoffs_per_month = st.number_input(
+            "Total week offs per member per month",
+            min_value=0,
+            max_value=15,
+            value=8,
+            step=1,
+            disabled=not can_manage,
         )
-        if dashboard_section == "Overview":
-            render_google_ads(user)
-            render_metrics(filtered_transactions)
-            render_quick_insights(filtered_transactions)
-            render_period_stats(transactions)
-            render_recent_transactions_cards(filtered_transactions)
-        if dashboard_section == "Add":
-            render_add_transaction_section(user, categories)
-        if dashboard_section == "Insights":
-            render_pie_chart(filtered_transactions)
-            render_monthly_trends(filtered_transactions)
-        if dashboard_section == "Transactions":
-            render_transactions_table(filtered_transactions, user)
-        if dashboard_section == "Settings":
-            render_category_manager(user)
-            render_recap_section(user)
-        if dashboard_section == "Developer Admin":
-            render_admin_panel(user)
-        return
+        st.markdown(
+            """
+            **Daily Staffing**
+            - Morning: 2
+            - Afternoon: 2
+            - Night: 2
+            - Night may temporarily go to 3 on non-restricted days only when needed so every eligible member can still receive a Night block
 
-    dashboard_section = render_section_navigation(
-        ["Overview", "Add", "Insights", "Transactions", "Settings"],
-        DASHBOARD_SECTION_KEY,
+            **Scheduling Rules**
+            - One continuous Night block per member per month
+            - Maximum 5 continuous Night shifts
+            - 2 compulsory WOs after a Night block
+            - Maximum 6 continuous working days
+
+            **Weekend And Bank Holidays**
+            - Only 2 members per shift work
+            - Extra synced members may follow a primary from Shift Sync Groups
+            """
+        )
+        st.divider()
+        st.caption(f"Database storage: {DB_FILE.name}")
+        st.caption("Legacy JSON saves are imported automatically if they already exist.")
+
+active_bundle = st.session_state.get("rota_bundle")
+active_metadata = active_bundle["metadata"] if active_bundle else (saved_rota["metadata"] if saved_rota else {})
+hero_badges = [f"Role: {st.session_state['auth_role'].title()}"]
+if active_metadata.get("start_date") and active_metadata.get("end_date"):
+    hero_badges.append(f"Window: {active_metadata['start_date']} to {active_metadata['end_date']}")
+if active_metadata.get("saved_at"):
+    hero_badges.append(f"Last save: {active_metadata['saved_at']} UTC")
+else:
+    hero_badges.append("Snapshot: Not generated yet")
+
+if can_manage:
+    render_page_hero(
+        "Operations Workspace",
+        "ROTA Control Center",
+        "Manage members, shape the schedule, and publish support coverage from one streamlined workspace.",
+        hero_badges,
+    )
+else:
+    render_page_hero(
+        "Member View",
+        "Saved ROTA Matrix",
+        "Browse the latest rota snapshot and quickly check who is available during a change window.",
+        hero_badges,
     )
 
-    if dashboard_section == "Overview":
-        render_google_ads(user)
-        render_metrics(filtered_transactions)
-        render_quick_insights(filtered_transactions)
-        render_period_stats(transactions)
-        render_recent_transactions_cards(filtered_transactions)
+rota_bundle = None
 
-    if dashboard_section == "Add":
-        render_add_transaction_section(user, categories)
+if can_manage:
+    render_section_header("01", "Team Members", "Add, import, and maintain the support roster. Changes here are stored in the database for future sessions.")
+    upload_col, template_col = st.columns([1.6, 1])
+    with upload_col:
+        uploaded_team_file = st.file_uploader(
+            "Import team members from Excel",
+            type=["xlsx", "xls"],
+            accept_multiple_files=False,
+            help="Upload an Excel sheet with columns such as name, dept, file_id, phone_number, and afternoon_only.",
+            key="team_excel_upload",
+        )
+    with template_col:
+        team_template_buffer = io.BytesIO()
+        sample_team_df().to_excel(team_template_buffer, index=False, engine="openpyxl")
+        team_template_buffer.seek(0)
+        st.download_button(
+            "Download Excel Template",
+            data=team_template_buffer.getvalue(),
+            file_name="team_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+        )
+    if uploaded_team_file is not None:
+        try:
+            imported_team_df = normalize_team_import_df(pd.read_excel(uploaded_team_file))
+            st.session_state["team_import_df"] = imported_team_df
+            st.success(f"Loaded {len(imported_team_df)} members from Excel. Review the table below, then save inputs.")
+        except Exception as e:
+            st.error(f"Could not import team members from Excel: {e}")
 
-    if dashboard_section == "Insights":
-        render_pie_chart(filtered_transactions)
-        render_monthly_trends(filtered_transactions)
+    team_editor_source = st.session_state.get("team_import_df")
+    if isinstance(team_editor_source, pd.DataFrame):
+        team_default_df = team_editor_source.copy()
 
-    if dashboard_section == "Transactions":
-        render_transactions_table(filtered_transactions, user)
-
-    if dashboard_section == "Settings":
-        render_category_manager(user)
-        render_recap_section(user)
-
-
-def main() -> None:
-    st.set_page_config(
-        page_title="Expense and Credit Tracker",
-        page_icon="$",
-        layout="wide",
-        initial_sidebar_state="collapsed",
+    team_df = st.data_editor(
+        team_default_df,
+        num_rows="dynamic",
+        width="stretch",
+        column_config={
+            "name": st.column_config.TextColumn("Name"),
+            "dept": st.column_config.TextColumn("Dept."),
+            "file_id": st.column_config.TextColumn("File Id"),
+            "phone_number": st.column_config.TextColumn("Phone Number"),
+            "afternoon_only": st.column_config.SelectboxColumn("Afternoon-only exception", options=["Yes", "No"]),
+        },
+        key="team_editor",
     )
-    apply_custom_styles()
-    init_db()
 
-    current_user = None
-    user_id = st.session_state.get("user_id")
-    if user_id:
-        current_user = get_user_by_id(user_id)
-        if not current_user or not current_user["is_active"]:
-            st.session_state.pop("user_id", None)
-            current_user = None
+    row1, row2 = st.columns(2)
+    with row1:
+        if st.button("Save Team Details", width="stretch"):
+            try:
+                save_inputs(team_df, leaves_default_df, bank_holidays_default_df, sync_groups_default_df)
+                st.session_state["team_import_df"] = team_df.copy()
+                log_activity("Inputs", "Save Team Details", f"Saved {len(team_df)} team member rows.")
+                st.success("Team details saved to the database.")
+            except Exception as e:
+                st.error(f"Could not save team details: {e}")
+    with row2:
+        if st.button("Reset Saved Data", width="stretch"):
+            delete_state(STATE_KEY_INPUTS)
+            st.session_state["team_import_df"] = None
+            if DATA_FILE.exists():
+                DATA_FILE.unlink()
+            log_activity("Inputs", "Reset Saved Input Data", "Cleared the saved team/input data snapshot.")
+            st.success("Saved input data cleared from the database. Refresh the app.")
 
-    if not current_user:
-        render_login_screen()
-        return
+    render_section_header("02", "Leaves", "Capture leave ranges so rota generation respects planned absences.")
+    leaves_df = st.data_editor(
+        leaves_default_df,
+        num_rows="dynamic",
+        width="stretch",
+        column_config={
+            "name": st.column_config.TextColumn("Name"),
+            "leave_start_date": st.column_config.DateColumn("Leave start date"),
+            "leave_end_date": st.column_config.DateColumn("Leave end date"),
+        },
+        key="leave_editor",
+    )
 
-    render_user_dashboard(current_user)
+    render_section_header("03", "Bank Holidays", "Choose how bank holidays are added so restricted staffing rules apply automatically.")
+    bh_mode = st.radio(
+        "Select bank holiday input mode",
+        ["No bank holidays", "By number of days", "By specific dates", "Both"],
+        horizontal=True,
+    )
+    auto_bh_days = 0
+    if bh_mode in {"By number of days", "Both"}:
+        auto_bh_days = st.number_input("Number of bank holidays per month", min_value=0, max_value=10, value=1, step=1)
 
+    specific_bh_df = bank_holidays_default_df.copy()
+    if bh_mode in {"By specific dates", "Both"}:
+        specific_bh_df = st.data_editor(
+            bank_holidays_default_df,
+            num_rows="dynamic",
+            width="stretch",
+            column_config={"bank_holiday_date": st.column_config.DateColumn("Bank holiday date")},
+            key="bh_editor",
+        )
 
-if __name__ == "__main__":
-    main()
+    render_section_header("04", "Shift Sync Groups", "Define primary-led sync groups so linked members follow the same shift whenever possible.")
+    st.caption("Enter comma-separated member names in order. The first member is treated as the primary shift member, and the remaining members will follow the same shift whenever possible. Example: Aarav, Bhavna, Divya")
+    sync_groups_df = st.data_editor(
+        sync_groups_default_df,
+        num_rows="dynamic",
+        width="stretch",
+        column_config={"sync_group": st.column_config.TextColumn("Sync group (primary first)")},
+        key="sync_groups_editor",
+    )
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        save_all = st.button("Save All Inputs", width="stretch")
+    with col2:
+        generate = st.button("Generate ROTA", type="primary", width="stretch")
+    with col3:
+        st.download_button(
+            "Download Team Template CSV",
+            data=sample_team_df().to_csv(index=False).encode("utf-8"),
+            file_name="team_template.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+    if save_all:
+        try:
+            save_inputs(team_df, leaves_df, specific_bh_df, sync_groups_df)
+            st.session_state["team_import_df"] = team_df.copy()
+            log_activity("Inputs", "Save All Inputs", f"Saved inputs for {start_date.isoformat()} to {end_date.isoformat()}.")
+            st.success("Inputs saved to the database.")
+        except Exception as e:
+            st.error(f"Could not save inputs: {e}")
+
+    if generate:
+        try:
+            if end_date < start_date:
+                st.error("End date must be on or after start date.")
+                st.stop()
+
+            members = parse_members(team_df)
+            valid_names = {m.name for m in members}
+            leaves_map = parse_leaves(leaves_df, valid_names)
+            sync_groups = parse_sync_groups(sync_groups_df, valid_names)
+            bank_holidays = resolve_selected_bank_holidays(start_date, end_date, bh_mode, int(auto_bh_days), specific_bh_df)
+
+            save_inputs(team_df, leaves_df, specific_bh_df, sync_groups_df)
+
+            matrix_df, full_df, daywise_df, summary_df, warnings_df = generate_rota(
+                members=members,
+                leaves=leaves_map,
+                start_date=start_date,
+                end_date=end_date,
+                global_weekoffs_per_month=int(weekoffs_per_month),
+                bank_holidays=bank_holidays,
+                sync_groups=sync_groups,
+            )
+            excel_bytes = to_excel_bytes(matrix_df, full_df, daywise_df, summary_df, warnings_df, bank_holidays)
+            save_generated_rota(matrix_df, full_df, daywise_df, summary_df, warnings_df, bank_holidays, start_date, end_date, excel_bytes)
+
+            rota_bundle = {
+                "metadata": {
+                    "saved_at": datetime.utcnow().isoformat(timespec="seconds"),
+                    "start_date": start_date.isoformat(),
+                    "end_date": end_date.isoformat(),
+                },
+                "matrix_df": matrix_df,
+                "full_df": full_df,
+                "daywise_df": daywise_df,
+                "summary_df": summary_df,
+                "warnings_df": warnings_df,
+                "bank_holidays": bank_holidays,
+                "excel_bytes": excel_bytes,
+            }
+            st.session_state["rota_bundle"] = rota_bundle
+            log_activity("Rota", "Generate ROTA", f"Generated rota for {start_date.isoformat()} to {end_date.isoformat()}.")
+            st.success("ROTA generated and saved to the database.")
+        except Exception as e:
+            st.error(str(e))
+
+else:
+    render_inline_note("info", "Read-only access", "You can view the saved ROTA matrix and use change-support availability, but editing and generation controls are hidden.")
+
+if rota_bundle is None:
+    rota_bundle = st.session_state.get("rota_bundle")
+
+if rota_bundle is None and saved_rota is not None:
+    try:
+        excel_bytes = ROTA_EXCEL_FILE.read_bytes() if ROTA_EXCEL_FILE.exists() else to_excel_bytes(
+            saved_rota["matrix_df"], saved_rota["full_df"], saved_rota["daywise_df"], saved_rota["summary_df"], saved_rota["warnings_df"], saved_rota["bank_holidays"]
+        )
+        rota_bundle = {
+            "metadata": saved_rota["metadata"],
+            "matrix_df": saved_rota["matrix_df"],
+            "full_df": saved_rota["full_df"],
+            "daywise_df": saved_rota["daywise_df"],
+            "summary_df": saved_rota["summary_df"],
+            "warnings_df": saved_rota["warnings_df"],
+            "bank_holidays": saved_rota["bank_holidays"],
+            "excel_bytes": excel_bytes,
+        }
+        render_inline_note("info", "Saved rota loaded", f"Loaded the last database snapshot. Saved at {saved_rota['metadata'].get('saved_at', 'previous run')} UTC.")
+    except Exception as e:
+        st.warning(f"Could not load saved rota: {e}")
+
+if rota_bundle is not None:
+    matrix_df = rota_bundle["matrix_df"]
+    full_df = rota_bundle["full_df"]
+    daywise_df = rota_bundle["daywise_df"]
+    summary_df = rota_bundle["summary_df"]
+    warnings_df = rota_bundle["warnings_df"]
+    bank_holidays = rota_bundle["bank_holidays"]
+    excel_bytes = rota_bundle["excel_bytes"]
+    csv_bytes = matrix_df.to_csv(index=False).encode("utf-8")
+
+    if bank_holidays:
+        render_inline_note("info", "Bank holidays highlighted", "Bank holiday dates are marked in the matrix headers, and restricted staffing rules still apply on those days.")
+
+    render_section_header(
+        "05",
+        "Generated ROTA",
+        "Review the saved rota outputs, switch between schedule views, and export the latest snapshot when needed.",
+    )
+
+    if can_manage:
+        tab_names = ["ROTA Matrix", "Full Shift Names", "Day Wise Schedule", "Summary", "Warnings", "Change Support Availability", "Manual Overrides", "Dev Console"]
+    else:
+        tab_names = ["ROTA Matrix", "Change Support Availability"]
+    tabs = st.tabs(tab_names)
+
+    with tabs[0]:
+        st.dataframe(style_matrix(matrix_df, bank_holidays), width="stretch", hide_index=True)
+
+    if can_manage:
+        with tabs[1]:
+            st.dataframe(full_df, width="stretch", hide_index=True)
+
+        with tabs[2]:
+            st.dataframe(daywise_df, width="stretch", hide_index=True)
+
+        with tabs[3]:
+            st.dataframe(summary_df, width="stretch", hide_index=True)
+
+        with tabs[4]:
+            st.dataframe(warnings_df, width="stretch", hide_index=True)
+
+        change_tab = tabs[5]
+        override_tab = tabs[6]
+        dev_tab = tabs[7]
+    else:
+        change_tab = tabs[1]
+        override_tab = None
+        dev_tab = None
+
+    with change_tab:
+        render_section_header("CS", "Change Support Availability", "Select a GMT change window to surface rota-aligned support coverage. Up to 3 resources are allocated per shift and date.")
+
+        col_a, col_b = st.columns(2)
+        default_start = date.fromisoformat(rota_bundle["metadata"].get("start_date", date.today().isoformat()))
+        default_end = date.fromisoformat(rota_bundle["metadata"].get("end_date", date.today().isoformat()))
+
+        with col_a:
+            chg_start_date = st.date_input("Change start date (GMT)", value=default_start, key="chg_start_date")
+            chg_start_time = st.time_input("Change start time (GMT)", value=time(1, 0), key="chg_start_time")
+        with col_b:
+            chg_end_date = st.date_input("Change end date (GMT)", value=default_end, key="chg_end_date")
+            chg_end_time = st.time_input("Change end time (GMT)", value=time(10, 30), key="chg_end_time")
+
+        change_start = datetime.combine(chg_start_date, chg_start_time)
+        change_end = datetime.combine(chg_end_date, chg_end_time)
+
+        if change_end <= change_start:
+            st.error("Change end datetime must be after start datetime.")
+        else:
+            detail_df, avail_summary_df = compute_change_availability(full_df, change_start, change_end, max_per_shift=3)
+
+            top1, top2, top3 = st.columns(3)
+            with top1:
+                st.metric("Allocated resources", int(avail_summary_df.shape[0]))
+            with top2:
+                st.metric("Covering shift rows", int(detail_df.shape[0]))
+            with top3:
+                st.metric("Change duration (hrs)", round((change_end - change_start).total_seconds() / 3600, 2))
+
+            st.markdown("#### Allocated resources by shift/date (max 3 per shift)")
+            st.dataframe(avail_summary_df, width="stretch", hide_index=True)
+
+            if can_manage:
+                st.markdown("#### Detailed overlap by rota date and shift")
+                st.dataframe(detail_df, width="stretch", hide_index=True)
+
+            if not avail_summary_df.empty:
+                change_csv = avail_summary_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download available resources CSV",
+                    data=change_csv,
+                    file_name="change_allocated_resources.csv",
+                    mime="text/csv",
+                    width="stretch",
+                )
+
+        st.markdown("#### Shift timing reference (GMT)")
+        st.dataframe(
+            pd.DataFrame([
+                {"shift": "Morning", "start_gmt": "01:00", "end_gmt": "10:30"},
+                {"shift": "Afternoon", "start_gmt": "07:30", "end_gmt": "17:00"},
+                {"shift": "Night", "start_gmt": "15:30", "end_gmt": "01:00 next day"},
+            ]),
+            width="stretch",
+            hide_index=True,
+        )
+
+    if override_tab is not None:
+        with override_tab:
+            render_section_header("MO", "Manual Shift Overrides", "Adjust generated shifts after rota creation. Saving here refreshes the matrix, warnings, exports, and database snapshot.")
+            editable_full_df = normalize_full_rota_df(full_df)
+            date_cols = extract_date_columns(editable_full_df)
+            column_config = {
+                "name": st.column_config.TextColumn("Name", disabled=True),
+                "dept": st.column_config.TextColumn("Dept.", disabled=True),
+                "file_id": st.column_config.TextColumn("File Id", disabled=True),
+                "phone_number": st.column_config.TextColumn("Phone Number", disabled=True),
+                "primary_for": st.column_config.TextColumn("Primary for", disabled=True),
+                "synced_to": st.column_config.TextColumn("Synced to", disabled=True),
+            }
+            for col in date_cols:
+                column_config[col] = st.column_config.SelectboxColumn(
+                    col,
+                    options=[SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT, SHIFT_WEEKOFF, SHIFT_LEAVE],
+                )
+
+            edited_full_df = st.data_editor(
+                editable_full_df,
+                width="stretch",
+                hide_index=True,
+                disabled=["name", "dept", "file_id", "phone_number", "primary_for", "synced_to"],
+                column_config=column_config,
+                key="manual_override_editor",
+            )
+
+            if st.button("Save Manual Overrides", type="primary", width="stretch"):
+                try:
+                    updated_bundle = save_overridden_rota(edited_full_df, rota_bundle["metadata"], bank_holidays)
+                    st.session_state["rota_bundle"] = updated_bundle
+                    log_activity("Rota", "Save Manual Overrides", "Saved manual shift overrides for the current rota snapshot.")
+                    st.success("Manual overrides saved to the database.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not save manual overrides: {e}")
+
+    if dev_tab is not None:
+        with dev_tab:
+            render_dev_console(
+                team_df=team_df,
+                leaves_df=leaves_df,
+                sync_groups_df=sync_groups_df,
+                start_date=start_date,
+                end_date=end_date,
+                bank_holiday_mode=bh_mode,
+                auto_bank_holiday_days=int(auto_bh_days),
+                specific_bank_holiday_df=specific_bh_df,
+            )
+
+    if can_manage:
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                "Download Excel",
+                data=excel_bytes,
+                file_name="rota_output.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="stretch",
+            )
+        with d2:
+            st.download_button(
+                "Download Matrix CSV",
+                data=csv_bytes,
+                file_name="rota_matrix.csv",
+                mime="text/csv",
+                width="stretch",
+            )
+else:
+    if can_manage:
+        render_inline_note("info", "No rota yet", "Generate a rota to unlock the schedule tabs, exports, and change-support availability views.")
+        render_dev_console(
+            team_df=team_df,
+            leaves_df=leaves_df,
+            sync_groups_df=sync_groups_df,
+            start_date=start_date,
+            end_date=end_date,
+            bank_holiday_mode=bh_mode,
+            auto_bank_holiday_days=int(auto_bh_days),
+            specific_bank_holiday_df=specific_bh_df,
+        )
+    else:
+        render_inline_note("warning", "No saved rota found", "Ask an Admin or Dev to generate the rota first so the saved schedule can be viewed here.")
