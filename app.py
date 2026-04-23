@@ -27,6 +27,11 @@ STATE_KEY_AUTH_USERS = "auth_users"
 STATE_KEY_AUTH_SESSION = "auth_session"
 STATE_KEY_ACTIVITY_LOG = "activity_log"
 ACTIVITY_LOG_LIMIT = 400
+TEAM_EDITOR_KEY = "team_editor_v2"
+LEAVE_EDITOR_KEY = "leave_editor_v2"
+BH_EDITOR_KEY = "bh_editor_v2"
+SYNC_GROUPS_EDITOR_KEY = "sync_groups_editor_v2"
+PREASSIGNED_EDITOR_KEY = "preassigned_shifts_editor_v2"
 
 SHIFT_MORNING = "Morning"
 SHIFT_AFTERNOON = "Afternoon"
@@ -233,6 +238,13 @@ def ensure_date_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
             df[col] = pd.NaT
         df[col] = pd.to_datetime(df[col], errors="coerce")
     return df
+
+
+def prepare_date_editor_df(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    normalized_df = ensure_date_columns(df, cols)
+    for col in cols:
+        normalized_df[col] = normalized_df[col].apply(lambda value: value.date() if not pd.isna(value) else None)
+    return normalized_df
 
 
 def sample_team_df() -> pd.DataFrame:
@@ -3756,7 +3768,7 @@ if can_manage:
             "phone_number": st.column_config.TextColumn("Phone Number"),
             "afternoon_only": st.column_config.SelectboxColumn("Afternoon-only exception", options=["Yes", "No"]),
         },
-        key="team_editor",
+        key=TEAM_EDITOR_KEY,
     )
 
     row1, row2 = st.columns(2)
@@ -3782,6 +3794,11 @@ if can_manage:
                 "bh_editor",
                 "sync_groups_editor",
                 "preassigned_shifts_editor",
+                TEAM_EDITOR_KEY,
+                LEAVE_EDITOR_KEY,
+                BH_EDITOR_KEY,
+                SYNC_GROUPS_EDITOR_KEY,
+                PREASSIGNED_EDITOR_KEY,
                 "schedule_setup_start_date",
                 "schedule_setup_end_date",
                 "schedule_setup_weekoffs",
@@ -3796,8 +3813,9 @@ if can_manage:
             st.rerun()
 
     render_section_header("02", "Leaves", "Capture leave ranges so rota generation respects planned absences.")
+    leaves_editor_df = prepare_date_editor_df(leaves_default_df, ["leave_start_date", "leave_end_date"])
     leaves_df = st.data_editor(
-        leaves_default_df,
+        leaves_editor_df,
         num_rows="dynamic",
         width="stretch",
         column_config={
@@ -3805,7 +3823,7 @@ if can_manage:
             "leave_start_date": st.column_config.DateColumn("Leave start date"),
             "leave_end_date": st.column_config.DateColumn("Leave end date"),
         },
-        key="leave_editor",
+        key=LEAVE_EDITOR_KEY,
     )
 
     render_section_header("03", "Bank Holidays", "Choose how bank holidays are added so restricted staffing rules apply automatically.")
@@ -3827,14 +3845,14 @@ if can_manage:
             key="schedule_setup_auto_bh_days",
         )
 
-    specific_bh_df = bank_holidays_default_df.copy()
+    specific_bh_df = prepare_date_editor_df(bank_holidays_default_df, ["bank_holiday_date"])
     if bh_mode in {"By specific dates", "Both"}:
         specific_bh_df = st.data_editor(
-            bank_holidays_default_df,
+            specific_bh_df,
             num_rows="dynamic",
             width="stretch",
             column_config={"bank_holiday_date": st.column_config.DateColumn("Bank holiday date")},
-            key="bh_editor",
+            key=BH_EDITOR_KEY,
         )
 
     render_section_header("04", "Shift Sync Groups", "Define primary-led sync groups so linked members follow the same shift whenever possible.")
@@ -3844,7 +3862,7 @@ if can_manage:
         num_rows="dynamic",
         width="stretch",
         column_config={"sync_group": st.column_config.TextColumn("Sync group (primary first)")},
-        key="sync_groups_editor",
+        key=SYNC_GROUPS_EDITOR_KEY,
     )
 
     render_section_header(
@@ -3858,7 +3876,7 @@ if can_manage:
         "If you preassign Night dates for a member in a month, the app treats them as one continuous Night block and keeps the compulsory WOs after that block."
     )
     preassigned_df = st.data_editor(
-        preassigned_default_df,
+        prepare_date_editor_df(preassigned_default_df, ["start_date", "end_date"]),
         num_rows="dynamic",
         width="stretch",
         column_config={
@@ -3870,7 +3888,7 @@ if can_manage:
                 options=[SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT, SHIFT_WEEKOFF, SHIFT_LEAVE],
             ),
         },
-        key="preassigned_shifts_editor",
+        key=PREASSIGNED_EDITOR_KEY,
     )
     autosave_workspace_state(
         team_df=team_df,
