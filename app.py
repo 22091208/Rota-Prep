@@ -139,6 +139,7 @@ MAX_NIGHT = 3
 MAX_CONTINUOUS_NIGHT = 5
 MANDATORY_OFF_AFTER_NIGHT = 2
 MAX_CONTINUOUS_WORKING_DAYS = 6
+MONTH_OPTIONS = list(calendar.month_name)[1:]
 
 
 def init_database():
@@ -226,6 +227,11 @@ def month_key(dt: date) -> Tuple[int, int]:
     return dt.year, dt.month
 
 
+def month_bounds(year: int, month: int) -> Tuple[date, date]:
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, 1), date(year, month, last_day)
+
+
 def dates_in_range(start_date: date, end_date: date) -> List[date]:
     return [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
 
@@ -267,6 +273,99 @@ def coerce_optional_date(value: Any) -> Optional[date]:
     if not cleaned:
         return None
     return pd.to_datetime(cleaned).date()
+
+
+def clamp_date_to_window(value: Any, min_date: date, max_date: date, fallback: Optional[date] = None) -> date:
+    resolved_fallback = fallback or min_date
+    parsed_date = coerce_optional_date(value)
+    if parsed_date is None:
+        parsed_date = resolved_fallback
+    if parsed_date < min_date:
+        return min_date
+    if parsed_date > max_date:
+        return max_date
+    return parsed_date
+
+
+def sync_date_input_session_state(key: str, min_date: date, max_date: date, fallback: Optional[date] = None):
+    current_value = st.session_state.get(key, fallback or min_date)
+    st.session_state[key] = clamp_date_to_window(current_value, min_date, max_date, fallback or min_date)
+
+
+def sanitize_leave_rows_for_window(rows: List[dict], window_start: date, window_end: date) -> Tuple[List[dict], int, int]:
+    sanitized_rows: List[dict] = []
+    clipped_count = 0
+    removed_count = 0
+    for row in rows:
+        start_dt = coerce_optional_date(row.get("leave_start_date"))
+        end_dt = coerce_optional_date(row.get("leave_end_date")) or start_dt
+        if start_dt is None or end_dt is None:
+            continue
+        if end_dt < window_start or start_dt > window_end:
+            removed_count += 1
+            continue
+        clipped_start = max(start_dt, window_start)
+        clipped_end = min(end_dt, window_end)
+        if clipped_start != start_dt or clipped_end != end_dt:
+            clipped_count += 1
+        sanitized_rows.append(
+            {
+                "id": row.get("id", make_entry_id()),
+                "name": normalize_text_input(row.get("name", "")),
+                "leave_start_date": clipped_start,
+                "leave_end_date": clipped_end,
+            }
+        )
+    return sanitized_rows, clipped_count, removed_count
+
+
+def sanitize_bank_holiday_rows_for_window(rows: List[dict], window_start: date, window_end: date) -> Tuple[List[dict], int]:
+    sanitized_rows: List[dict] = []
+    removed_count = 0
+    for row in rows:
+        holiday_dt = coerce_optional_date(row.get("bank_holiday_date"))
+        if holiday_dt is None:
+            continue
+        if holiday_dt < window_start or holiday_dt > window_end:
+            removed_count += 1
+            continue
+        sanitized_rows.append(
+            {
+                "id": row.get("id", make_entry_id()),
+                "bank_holiday_date": holiday_dt,
+            }
+        )
+    return sanitized_rows, removed_count
+
+
+def sanitize_preassigned_rows_for_window(rows: List[dict], window_start: date, window_end: date) -> Tuple[List[dict], int, int]:
+    sanitized_rows: List[dict] = []
+    clipped_count = 0
+    removed_count = 0
+    for row in rows:
+        start_dt = coerce_optional_date(row.get("start_date"))
+        raw_end_dt = coerce_optional_date(row.get("end_date"))
+        end_dt = raw_end_dt or start_dt
+        if start_dt is None or end_dt is None:
+            continue
+        if end_dt < window_start or start_dt > window_end:
+            removed_count += 1
+            continue
+        clipped_start = max(start_dt, window_start)
+        clipped_end = min(end_dt, window_end)
+        if clipped_start != start_dt or clipped_end != end_dt:
+            clipped_count += 1
+        normalized_end = clipped_end if raw_end_dt is not None and clipped_end > clipped_start else None
+        sanitized_rows.append(
+            {
+                "id": row.get("id", make_entry_id()),
+                "name": normalize_text_input(row.get("name", "")),
+                "start_date": clipped_start,
+                "end_date": normalized_end,
+                "fixed_shift": normalize_text_input(row.get("fixed_shift", "")),
+            }
+        )
+    return sanitized_rows, clipped_count, removed_count
 
 
 def make_entry_id() -> str:
@@ -453,7 +552,17 @@ def sync_group_entries_to_df(rows: List[dict]) -> pd.DataFrame:
 
 def render_leave_entries_editor(team_df: pd.DataFrame, default_df: pd.DataFrame, window_start: date, window_end: date) -> pd.DataFrame:
     rows = ensure_entries_state(LEAVE_ENTRIES_STATE, leave_entries_from_df(default_df))
+    rows, clipped_count, removed_count = sanitize_leave_rows_for_window(rows, window_start, window_end)
+    st.session_state[LEAVE_ENTRIES_STATE] = rows
     member_options = member_options_from_df(team_df)
+
+    if clipped_count or removed_count:
+        note_parts = []
+        if clipped_count:
+            note_parts.append(f"{clipped_count} leave entr{'y' if clipped_count == 1 else 'ies'} clipped to the selected month")
+        if removed_count:
+            note_parts.append(f"{removed_count} leave entr{'y' if removed_count == 1 else 'ies'} from another month removed from the current workspace")
+        st.caption(". ".join(note_parts) + ".")
 
     header_cols = st.columns([1.35, 1, 1, 0.42])
     header_cols[0].markdown("**Member**")
@@ -468,6 +577,10 @@ def render_leave_entries_editor(team_df: pd.DataFrame, default_df: pd.DataFrame,
         cols = st.columns([1.35, 1, 1, 0.42])
         name_options = selectbox_options_for_value(member_options, row.get("name", ""))
         current_name = normalize_text_input(row.get("name", ""))
+        start_key = f"leave_start_{row_id}"
+        end_key = f"leave_end_{row_id}"
+        row_start = clamp_date_to_window(row.get("leave_start_date"), window_start, window_end, window_start)
+        sync_date_input_session_state(start_key, window_start, window_end, row_start)
         selected_name = cols[0].selectbox(
             "Member",
             options=name_options,
@@ -477,20 +590,21 @@ def render_leave_entries_editor(team_df: pd.DataFrame, default_df: pd.DataFrame,
         )
         selected_start = cols[1].date_input(
             "Leave start date",
-            value=row.get("leave_start_date", window_start),
+            value=st.session_state.get(start_key, row_start),
             min_value=window_start,
             max_value=window_end,
-            key=f"leave_start_{row_id}",
+            key=start_key,
             label_visibility="collapsed",
             width="stretch",
         )
-        current_end = row.get("leave_end_date") or selected_start
+        current_end = clamp_date_to_window(row.get("leave_end_date") or selected_start, selected_start, window_end, selected_start)
+        sync_date_input_session_state(end_key, selected_start, window_end, current_end)
         selected_end = cols[2].date_input(
             "Leave end date",
-            value=max(current_end, selected_start),
+            value=st.session_state.get(end_key, current_end),
             min_value=selected_start,
             max_value=window_end,
-            key=f"leave_end_{row_id}",
+            key=end_key,
             label_visibility="collapsed",
             width="stretch",
         )
@@ -521,18 +635,20 @@ def render_leave_entries_editor(team_df: pd.DataFrame, default_df: pd.DataFrame,
         key="leave_add_name",
         label_visibility="collapsed",
     )
+    sync_date_input_session_state("leave_add_start", window_start, window_end, window_start)
     add_start = add_cols[1].date_input(
         "Leave start date",
-        value=window_start,
+        value=st.session_state.get("leave_add_start", window_start),
         min_value=window_start,
         max_value=window_end,
         key="leave_add_start",
         label_visibility="collapsed",
         width="stretch",
     )
+    sync_date_input_session_state("leave_add_end", add_start, window_end, add_start)
     add_end = add_cols[2].date_input(
         "Leave end date",
-        value=add_start,
+        value=st.session_state.get("leave_add_end", add_start),
         min_value=add_start,
         max_value=window_end,
         key="leave_add_end",
@@ -558,6 +674,11 @@ def render_leave_entries_editor(team_df: pd.DataFrame, default_df: pd.DataFrame,
 
 def render_bank_holiday_entries_editor(default_df: pd.DataFrame, window_start: date, window_end: date) -> pd.DataFrame:
     rows = ensure_entries_state(BANK_HOLIDAY_ENTRIES_STATE, bank_holiday_entries_from_df(default_df))
+    rows, removed_count = sanitize_bank_holiday_rows_for_window(rows, window_start, window_end)
+    st.session_state[BANK_HOLIDAY_ENTRIES_STATE] = rows
+
+    if removed_count:
+        st.caption(f"{removed_count} bank holiday entr{'y' if removed_count == 1 else 'ies'} from another month removed from the current workspace.")
 
     header_cols = st.columns([1, 0.42])
     header_cols[0].markdown("**Bank Holiday Date**")
@@ -568,12 +689,15 @@ def render_bank_holiday_entries_editor(default_df: pd.DataFrame, window_start: d
     for row in rows:
         row_id = row["id"]
         cols = st.columns([1, 0.42])
+        date_key = f"bank_holiday_date_{row_id}"
+        row_date = clamp_date_to_window(row.get("bank_holiday_date"), window_start, window_end, window_start)
+        sync_date_input_session_state(date_key, window_start, window_end, row_date)
         selected_date = cols[0].date_input(
             "Bank holiday date",
-            value=row.get("bank_holiday_date", window_start),
+            value=st.session_state.get(date_key, row_date),
             min_value=window_start,
             max_value=window_end,
-            key=f"bank_holiday_date_{row_id}",
+            key=date_key,
             label_visibility="collapsed",
             width="stretch",
         )
@@ -590,9 +714,10 @@ def render_bank_holiday_entries_editor(default_df: pd.DataFrame, window_start: d
         st.caption("No bank holiday dates added yet.")
 
     add_cols = st.columns([1, 0.42])
+    sync_date_input_session_state("bank_holiday_add_date", window_start, window_end, window_start)
     add_date = add_cols[0].date_input(
         "Add bank holiday date",
-        value=window_start,
+        value=st.session_state.get("bank_holiday_add_date", window_start),
         min_value=window_start,
         max_value=window_end,
         key="bank_holiday_add_date",
@@ -699,8 +824,18 @@ def render_sync_group_entries_editor(team_df: pd.DataFrame, default_df: pd.DataF
 
 def render_preassigned_entries_editor(team_df: pd.DataFrame, default_df: pd.DataFrame, window_start: date, window_end: date) -> pd.DataFrame:
     rows = ensure_entries_state(PREASSIGNED_ENTRIES_STATE, preassigned_entries_from_df(default_df))
+    rows, clipped_count, removed_count = sanitize_preassigned_rows_for_window(rows, window_start, window_end)
+    st.session_state[PREASSIGNED_ENTRIES_STATE] = rows
     member_options = member_options_from_df(team_df)
     fixed_shift_options = [SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT, SHIFT_WEEKOFF, SHIFT_LEAVE]
+
+    if clipped_count or removed_count:
+        note_parts = []
+        if clipped_count:
+            note_parts.append(f"{clipped_count} preassigned shift entr{'y' if clipped_count == 1 else 'ies'} clipped to the selected month")
+        if removed_count:
+            note_parts.append(f"{removed_count} preassigned shift entr{'y' if removed_count == 1 else 'ies'} from another month removed from the current workspace")
+        st.caption(". ".join(note_parts) + ".")
 
     header_cols = st.columns([1.2, 1, 1, 0.7, 1, 0.42])
     header_cols[0].markdown("**Member**")
@@ -718,6 +853,10 @@ def render_preassigned_entries_editor(team_df: pd.DataFrame, default_df: pd.Data
         name_options = selectbox_options_for_value(member_options, row.get("name", ""))
         current_name = normalize_text_input(row.get("name", ""))
         current_shift = normalize_text_input(row.get("fixed_shift", SHIFT_MORNING)) or SHIFT_MORNING
+        start_key = f"preassigned_start_{row_id}"
+        end_key = f"preassigned_end_{row_id}"
+        row_start = clamp_date_to_window(row.get("start_date"), window_start, window_end, window_start)
+        sync_date_input_session_state(start_key, window_start, window_end, row_start)
         selected_name = cols[0].selectbox(
             "Member",
             options=name_options,
@@ -734,10 +873,10 @@ def render_preassigned_entries_editor(team_df: pd.DataFrame, default_df: pd.Data
         )
         selected_start = cols[2].date_input(
             "Start date",
-            value=row.get("start_date", window_start),
+            value=st.session_state.get(start_key, row_start),
             min_value=window_start,
             max_value=window_end,
-            key=f"preassigned_start_{row_id}",
+            key=start_key,
             label_visibility="collapsed",
             width="stretch",
         )
@@ -748,13 +887,14 @@ def render_preassigned_entries_editor(team_df: pd.DataFrame, default_df: pd.Data
             label_visibility="collapsed",
         )
         if has_end_date:
-            current_end = row.get("end_date") or selected_start
+            current_end = clamp_date_to_window(row.get("end_date") or selected_start, selected_start, window_end, selected_start)
+            sync_date_input_session_state(end_key, selected_start, window_end, current_end)
             selected_end = cols[4].date_input(
                 "End date",
-                value=max(current_end, selected_start),
+                value=st.session_state.get(end_key, current_end),
                 min_value=selected_start,
                 max_value=window_end,
-                key=f"preassigned_end_{row_id}",
+                key=end_key,
                 label_visibility="collapsed",
                 width="stretch",
             )
@@ -795,9 +935,10 @@ def render_preassigned_entries_editor(team_df: pd.DataFrame, default_df: pd.Data
         key="preassigned_add_shift",
         label_visibility="collapsed",
     )
+    sync_date_input_session_state("preassigned_add_start", window_start, window_end, window_start)
     add_start = add_cols[2].date_input(
         "Start date",
-        value=window_start,
+        value=st.session_state.get("preassigned_add_start", window_start),
         min_value=window_start,
         max_value=window_end,
         key="preassigned_add_start",
@@ -811,9 +952,10 @@ def render_preassigned_entries_editor(team_df: pd.DataFrame, default_df: pd.Data
         label_visibility="collapsed",
     )
     if add_has_end:
+        sync_date_input_session_state("preassigned_add_end", add_start, window_end, add_start)
         add_end = add_cols[4].date_input(
             "End date",
-            value=add_start,
+            value=st.session_state.get("preassigned_add_end", add_start),
             min_value=add_start,
             max_value=window_end,
             key="preassigned_add_end",
@@ -1052,9 +1194,13 @@ def save_inputs(
 
 
 def default_schedule_setup() -> dict:
+    today = date.today()
+    start_date, end_date = month_bounds(today.year, today.month)
     return {
-        "start_date": date.today(),
-        "end_date": date.today() + timedelta(days=13),
+        "selected_year": today.year,
+        "selected_month": today.month,
+        "start_date": start_date,
+        "end_date": end_date,
         "weekoffs_per_month": 8,
         "bank_holiday_mode": "No bank holidays",
         "auto_bank_holiday_days": 1,
@@ -1068,9 +1214,14 @@ def build_schedule_setup_payload(
     bank_holiday_mode: str,
     auto_bank_holiday_days: int,
 ) -> dict:
+    selected_year = int(start_date.year)
+    selected_month = int(start_date.month)
+    normalized_start, normalized_end = month_bounds(selected_year, selected_month)
     return {
-        "start_date": start_date.isoformat(),
-        "end_date": end_date.isoformat(),
+        "selected_year": selected_year,
+        "selected_month": selected_month,
+        "start_date": normalized_start.isoformat(),
+        "end_date": normalized_end.isoformat(),
         "weekoffs_per_month": int(weekoffs_per_month),
         "bank_holiday_mode": str(bank_holiday_mode),
         "auto_bank_holiday_days": int(auto_bank_holiday_days),
@@ -1084,18 +1235,25 @@ def load_schedule_setup() -> dict:
         return defaults
 
     try:
-        start_date = date.fromisoformat(str(payload.get("start_date", defaults["start_date"].isoformat())))
-        end_date = date.fromisoformat(str(payload.get("end_date", defaults["end_date"].isoformat())))
+        fallback_start_date = date.fromisoformat(str(payload.get("start_date", defaults["start_date"].isoformat())))
+        selected_year = int(payload.get("selected_year", fallback_start_date.year))
+        selected_month = int(payload.get("selected_month", fallback_start_date.month))
         weekoffs_per_month = int(payload.get("weekoffs_per_month", defaults["weekoffs_per_month"]))
         bank_holiday_mode = str(payload.get("bank_holiday_mode", defaults["bank_holiday_mode"]))
         auto_bank_holiday_days = int(payload.get("auto_bank_holiday_days", defaults["auto_bank_holiday_days"]))
     except Exception:
         return defaults
 
+    selected_year = max(2000, min(2100, selected_year))
+    selected_month = max(1, min(12, selected_month))
+    start_date, end_date = month_bounds(selected_year, selected_month)
+
     if bank_holiday_mode not in {"No bank holidays", "By number of days", "By specific dates", "Both"}:
         bank_holiday_mode = defaults["bank_holiday_mode"]
 
     return {
+        "selected_year": selected_year,
+        "selected_month": selected_month,
         "start_date": start_date,
         "end_date": end_date,
         "weekoffs_per_month": max(0, min(15, weekoffs_per_month)),
@@ -1903,6 +2061,61 @@ def can_take_rebalanced_shift(
     return work_streak_if_shift_assigned(schedule, member, dt, shift, dates, date_index) <= MAX_CONTINUOUS_WORKING_DAYS
 
 
+def can_convert_weekoff_to_balanced_work(
+    schedule: Dict[str, Dict[date, str]],
+    member: str,
+    dt: date,
+    dates: List[date],
+    date_index: Dict[date, int],
+    member_map: Dict[str, Member],
+    locked_weekoffs: Set[Tuple[str, date]],
+    locked_assignments: Set[Tuple[str, date]],
+    bank_holidays: Set[date],
+) -> bool:
+    if schedule[member][dt] != SHIFT_WEEKOFF:
+        return False
+    if (member, dt) in locked_weekoffs or (member, dt) in locked_assignments:
+        return False
+    if is_restricted_staffing_day(dt, bank_holidays):
+        return False
+
+    member_info = member_map[member]
+    if member_info.afternoon_only and dt.weekday() >= 5:
+        return False
+
+    return work_streak_if_shift_assigned(schedule, member, dt, SHIFT_AFTERNOON, dates, date_index) <= MAX_CONTINUOUS_WORKING_DAYS
+
+
+def can_grant_balanced_weekoff(
+    schedule: Dict[str, Dict[date, str]],
+    member_names: List[str],
+    member: str,
+    dt: date,
+    bank_holidays: Set[date],
+    locked_weekoffs: Set[Tuple[str, date]],
+    locked_assignments: Set[Tuple[str, date]],
+) -> bool:
+    current_shift = schedule[member][dt]
+    if current_shift not in {SHIFT_MORNING, SHIFT_AFTERNOON}:
+        return False
+    if (member, dt) in locked_weekoffs or (member, dt) in locked_assignments:
+        return False
+
+    day_counts = {
+        SHIFT_MORNING: sum(schedule[name][dt] == SHIFT_MORNING for name in member_names),
+        SHIFT_AFTERNOON: sum(schedule[name][dt] == SHIFT_AFTERNOON for name in member_names),
+        SHIFT_NIGHT: sum(schedule[name][dt] == SHIFT_NIGHT for name in member_names),
+    }
+    if current_shift == SHIFT_MORNING:
+        return day_counts[SHIFT_MORNING] > MIN_MORNING
+    if current_shift == SHIFT_AFTERNOON:
+        minimum = MIN_AFTERNOON
+        if is_restricted_staffing_day(dt, bank_holidays):
+            minimum = MIN_AFTERNOON
+        return day_counts[SHIFT_AFTERNOON] > minimum
+    return False
+
+
 def rebalance_weekoff_targets(
     schedule: Dict[str, Dict[date, str]],
     member_names: List[str],
@@ -1937,6 +2150,7 @@ def rebalance_weekoff_targets(
         name: sum(1 for dt in dates if schedule[name][dt] == SHIFT_WEEKOFF)
         for name in member_names
     }
+    target_total = target_wo * len(member_names)
 
     changed = True
     while changed:
@@ -1950,6 +2164,73 @@ def rebalance_weekoff_targets(
             [name for name in member_names if month_wo[name] < target_wo],
             key=lambda name: (month_wo[name], name.lower()),
         )
+
+        total_weekoffs = sum(month_wo.values())
+        if total_weekoffs > target_total:
+            for over_name in over_target:
+                if month_wo[over_name] <= target_wo:
+                    continue
+
+                for dt in dates:
+                    if not can_convert_weekoff_to_balanced_work(
+                        schedule,
+                        over_name,
+                        dt,
+                        dates,
+                        date_index,
+                        member_map,
+                        locked_weekoffs,
+                        locked_assignments,
+                        bank_holidays,
+                    ):
+                        continue
+
+                    schedule[over_name][dt] = SHIFT_AFTERNOON
+                    month_wo[over_name] -= 1
+                    changed = True
+                    break
+
+                if changed:
+                    break
+
+            if changed:
+                continue
+
+        if total_weekoffs < target_total:
+            for under_name in under_target:
+                if month_wo[under_name] >= target_wo:
+                    continue
+
+                candidate_dates = sorted(
+                    dates,
+                    key=lambda dt: (
+                        schedule[under_name][dt] != SHIFT_AFTERNOON,
+                        is_restricted_staffing_day(dt, bank_holidays),
+                        dt,
+                    ),
+                )
+                for dt in candidate_dates:
+                    if not can_grant_balanced_weekoff(
+                        schedule,
+                        member_names,
+                        under_name,
+                        dt,
+                        bank_holidays,
+                        locked_weekoffs,
+                        locked_assignments,
+                    ):
+                        continue
+
+                    schedule[under_name][dt] = SHIFT_WEEKOFF
+                    month_wo[under_name] += 1
+                    changed = True
+                    break
+
+                if changed:
+                    break
+
+            if changed:
+                continue
 
         for over_name in over_target:
             if month_wo[over_name] <= target_wo:
@@ -3357,7 +3638,31 @@ def generate_rota(
             else:
                 idx += 1
 
-    rebalance_weekoff_targets(schedule, member_names, dates, target_wo, bank_holidays, member_map, locked_assignments)
+    target_weekoffs_per_member = sum(targets.values())
+    rebalance_weekoff_targets(schedule, member_names, dates, target_weekoffs_per_member, bank_holidays, member_map, locked_assignments)
+    post_rebalance_weekoffs = {
+        name: sum(1 for dt in dates if schedule[name][dt] == SHIFT_WEEKOFF)
+        for name in member_names
+    }
+    unequal_weekoff_members = sorted(
+        [name for name, count in post_rebalance_weekoffs.items() if count != target_weekoffs_per_member],
+        key=str.lower,
+    )
+    if unequal_weekoff_members:
+        preview = ", ".join(
+            f"{name} ({post_rebalance_weekoffs[name]})"
+            for name in unequal_weekoff_members[:6]
+        )
+        extra_suffix = "" if len(unequal_weekoff_members) <= 6 else f", and {len(unequal_weekoff_members) - 6} more"
+        warnings.append(
+            {
+                "date": start_date.isoformat(),
+                "warning": (
+                    f"Week Off balancing could not make every member reach the target of {target_weekoffs_per_member}. "
+                    f"Affected members: {preview}{extra_suffix}."
+                ),
+            }
+        )
 
     matrix_rows, full_rows, daywise_rows, summary_rows = [], [], [], []
     sync_map_text = {m.name: ", ".join(sync_groups.get(m.name, [])) for m in members}
@@ -3394,7 +3699,6 @@ def generate_rota(
             "status": "OK" if len(counts[SHIFT_MORNING]) >= MIN_MORNING and len(counts[SHIFT_AFTERNOON]) >= MIN_AFTERNOON and len(counts[SHIFT_NIGHT]) >= MIN_NIGHT else "Warning",
         })
 
-    target_total = sum(prorated_target(global_weekoffs_per_month, start_date, end_date).values())
     for m in members:
         summary_rows.append({
             "name": m.name,
@@ -3407,7 +3711,7 @@ def generate_rota(
             "afternoon_shifts": sum(1 for dt in dates if schedule[m.name][dt] == SHIFT_AFTERNOON),
             "night_shifts": sum(1 for dt in dates if schedule[m.name][dt] == SHIFT_NIGHT),
             "weekoffs_used": sum(1 for dt in dates if schedule[m.name][dt] == SHIFT_WEEKOFF),
-            "weekoffs_target": target_total,
+            "weekoffs_target": target_weekoffs_per_member,
             "leave_days": sum(1 for dt in dates if schedule[m.name][dt] == SHIFT_LEAVE),
             "working_days": sum(1 for dt in dates if is_working_shift(schedule[m.name][dt])),
         })
@@ -4631,18 +4935,29 @@ with st.sidebar:
     if can_manage:
         st.divider()
         st.header("Schedule Setup")
-        start_date = st.date_input(
-            "Start date",
-            value=schedule_setup_defaults["start_date"],
+        schedule_month_col, schedule_year_col = st.columns([1.4, 1])
+        selected_month_label = schedule_month_col.selectbox(
+            "Month",
+            options=MONTH_OPTIONS,
+            index=int(schedule_setup_defaults["selected_month"]) - 1,
             disabled=not can_manage,
-            key="schedule_setup_start_date",
+            key="schedule_setup_month",
         )
-        end_date = st.date_input(
-            "End date",
-            value=schedule_setup_defaults["end_date"],
-            disabled=not can_manage,
-            key="schedule_setup_end_date",
+        selected_year = int(
+            schedule_year_col.number_input(
+                "Year",
+                min_value=2000,
+                max_value=2100,
+                value=int(schedule_setup_defaults["selected_year"]),
+                step=1,
+                disabled=not can_manage,
+                key="schedule_setup_year",
+            )
         )
+        selected_month = MONTH_OPTIONS.index(selected_month_label) + 1
+        start_date, end_date = month_bounds(selected_year, selected_month)
+        st.caption(f"Schedule window: {start_date.isoformat()} to {end_date.isoformat()}")
+        st.caption("The rota is generated for the full selected month.")
         weekoffs_per_month = st.number_input(
             "Total week offs per member per month",
             min_value=0,
@@ -4817,6 +5132,8 @@ if can_manage:
                 "preassigned_add_end",
                 "schedule_setup_start_date",
                 "schedule_setup_end_date",
+                "schedule_setup_month",
+                "schedule_setup_year",
                 "schedule_setup_weekoffs",
                 "schedule_setup_bh_mode",
                 "schedule_setup_auto_bh_days",
