@@ -92,13 +92,19 @@ MANUAL_OVERRIDE_SHIFT_OPTIONS = [
 ]
 
 FULL_ROTA_NORMALIZATION_MAP = {
+    "m": SHIFT_MORNING,
     SHIFT_MORNING.lower(): SHIFT_MORNING,
+    "a": SHIFT_AFTERNOON,
     SHIFT_AFTERNOON.lower(): SHIFT_AFTERNOON,
+    "n": SHIFT_NIGHT,
     SHIFT_NIGHT.lower(): SHIFT_NIGHT,
+    "wo": SHIFT_WEEKOFF,
     SHIFT_WEEKOFF.lower(): SHIFT_WEEKOFF,
     "weekoff": SHIFT_WEEKOFF,
     "w/o": SHIFT_WEEKOFF,
+    "l": SHIFT_LEAVE,
     SHIFT_LEAVE.lower(): SHIFT_LEAVE,
+    "ul": SHIFT_UNPLANNED_LEAVE,
     SHIFT_UNPLANNED_LEAVE.lower(): SHIFT_UNPLANNED_LEAVE,
     "unplanned leave": SHIFT_UNPLANNED_LEAVE,
     "upl": SHIFT_UNPLANNED_LEAVE,
@@ -114,6 +120,8 @@ FULL_ROTA_NORMALIZATION_MAP = {
     "second half leave": SHIFT_HALF_DAY_LEAVE_SECOND_HALF,
     "half day second half": SHIFT_HALF_DAY_LEAVE_SECOND_HALF,
     "hd2": SHIFT_HALF_DAY_LEAVE_SECOND_HALF,
+    "-": SHIFT_UNASSIGNED,
+    "unassigned": SHIFT_UNASSIGNED,
 }
 
 # GMT shift timings
@@ -126,6 +134,8 @@ SHIFT_TIME_MAP = {
 MIN_MORNING = 2
 MIN_AFTERNOON = 2
 MIN_NIGHT = 2
+MAX_MORNING = 3
+MAX_NIGHT = 3
 MAX_CONTINUOUS_NIGHT = 5
 MANDATORY_OFF_AFTER_NIGHT = 2
 MAX_CONTINUOUS_WORKING_DAYS = 6
@@ -1154,21 +1164,28 @@ def autosave_workspace_state(
         save_state(STATE_KEY_SETUP, current_setup_payload)
 
 
-def save_generated_rota(matrix_df: pd.DataFrame, full_df: pd.DataFrame, daywise_df: pd.DataFrame,
-                        summary_df: pd.DataFrame, warnings_df: pd.DataFrame, bank_holidays: Set[date],
-                        start_date: date, end_date: date, excel_bytes: bytes):
+def save_generated_rota(
+    matrix_df: pd.DataFrame,
+    full_df: pd.DataFrame,
+    daywise_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    warnings_df: pd.DataFrame,
+    validation_df: pd.DataFrame,
+    bank_holidays: Set[date],
+    metadata: dict,
+    excel_bytes: bytes,
+):
+    payload_metadata = dict(metadata)
+    payload_metadata["saved_at"] = datetime.utcnow().isoformat(timespec="seconds")
+    payload_metadata["bank_holidays"] = sorted([d.isoformat() for d in bank_holidays])
     payload = {
-        "metadata": {
-            "saved_at": datetime.utcnow().isoformat(timespec="seconds"),
-            "start_date": start_date.isoformat(),
-            "end_date": end_date.isoformat(),
-            "bank_holidays": sorted([d.isoformat() for d in bank_holidays]),
-        },
+        "metadata": payload_metadata,
         "matrix_df": matrix_df.to_dict(orient="records"),
         "full_df": full_df.to_dict(orient="records"),
         "daywise_df": daywise_df.to_dict(orient="records"),
         "summary_df": summary_df.to_dict(orient="records"),
         "warnings_df": warnings_df.to_dict(orient="records"),
+        "validation_df": validation_df.to_dict(orient="records"),
     }
     save_state(STATE_KEY_ROTA, payload)
     ROTA_CSV_FILE.write_text(matrix_df.to_csv(index=False))
@@ -1188,6 +1205,7 @@ def load_saved_rota():
             "daywise_df": pd.DataFrame(payload.get("daywise_df", [])),
             "summary_df": pd.DataFrame(payload.get("summary_df", [])),
             "warnings_df": pd.DataFrame(payload.get("warnings_df", [])),
+            "validation_df": pd.DataFrame(payload.get("validation_df", [])),
             "bank_holidays": {datetime.strptime(d, "%Y-%m-%d").date() for d in payload.get("metadata", {}).get("bank_holidays", [])},
         }
     except Exception:
@@ -1352,6 +1370,14 @@ def is_leave_like_shift(shift: str) -> bool:
     return shift in LEAVE_LIKE_SHIFTS
 
 
+def daily_shift_cap(shift: str) -> int | None:
+    if shift == SHIFT_MORNING:
+        return MAX_MORNING
+    if shift == SHIFT_NIGHT:
+        return MAX_NIGHT
+    return None
+
+
 def apply_night_block_offs(schedule: Dict[str, Dict[date, str]], member: str, dates: List[date], start_index: int, block_len: int):
     for j in range(start_index + block_len, min(start_index + block_len + MANDATORY_OFF_AFTER_NIGHT, len(dates))):
         dt = dates[j]
@@ -1420,11 +1446,9 @@ def choose_shift_candidates(
         s = stats_map[name]
         continuity_bonus = -100 if s["prev_shift"] == shift else 0
         night_limit_penalty = 10_000 if shift == SHIFT_NIGHT and s["continuous_night"] >= MAX_CONTINUOUS_NIGHT else 0
-        night_block_penalty = 20_000 if shift == SHIFT_NIGHT and s["prev_shift"] != SHIFT_NIGHT and s["month_night_blocks"] >= 1 else 0
         total_assigned = shift_counts[SHIFT_MORNING][name] + shift_counts[SHIFT_AFTERNOON][name] + shift_counts[SHIFT_NIGHT][name]
         night_streak_priority = -s["continuous_night"] if shift == SHIFT_NIGHT else 0
         return (
-            night_block_penalty,
             night_limit_penalty,
             night_streak_priority,
             continuity_bonus,
@@ -1435,7 +1459,6 @@ def choose_shift_candidates(
         )
 
     eligible = []
-    relaxed_eligible = []
     for name in candidates:
         s = stats_map[name]
         if s["continuous_work"] >= MAX_CONTINUOUS_WORKING_DAYS:
@@ -1443,7 +1466,6 @@ def choose_shift_candidates(
         if shift == SHIFT_NIGHT and s["continuous_night"] >= MAX_CONTINUOUS_NIGHT:
             continue
         if shift == SHIFT_NIGHT and s["prev_shift"] != SHIFT_NIGHT and s["month_night_blocks"] >= 1:
-            relaxed_eligible.append(name)
             continue
         eligible.append(name)
 
@@ -1453,10 +1475,8 @@ def choose_shift_candidates(
             return sorted(continuing_night, key=score)[:needed]
         if continuing_night:
             remaining = [name for name in eligible if name not in continuing_night]
-            ordered = sorted(continuing_night, key=score) + sorted(remaining, key=score) + sorted(relaxed_eligible, key=score)
+            ordered = sorted(continuing_night, key=score) + sorted(remaining, key=score)
             return ordered[:needed]
-        if len(eligible) < needed and relaxed_eligible:
-            eligible = eligible + sorted(relaxed_eligible, key=score)
 
     return sorted(eligible, key=score)[:needed]
 
@@ -1548,6 +1568,8 @@ def pick_night_block_owner(
     for name in candidates:
         if member_map[name].afternoon_only:
             continue
+        if month_block_count[name].get(month, 0) >= 1:
+            continue
         if previous_dt and reservations[name].get(previous_dt) == SHIFT_NIGHT:
             continue
         if any(reservations[name].get(dt, SHIFT_UNASSIGNED) != SHIFT_UNASSIGNED for dt in block_dates):
@@ -1559,12 +1581,9 @@ def pick_night_block_owner(
     if not eligible:
         return None
 
-    unused_this_month = [name for name in eligible if month_block_count[name].get(month, 0) == 0]
-    pool = unused_this_month or eligible
     ranked = sorted(
-        pool,
+        eligible,
         key=lambda name: (
-            month_block_count[name].get(month, 0),
             len(sync_groups.get(name, [])),
             night_day_count[name],
             name.lower(),
@@ -1986,6 +2005,8 @@ def can_assign_shift(name: str, shift: str, dt: date, schedule: Dict[str, Dict[d
         return False
     if shift == SHIFT_NIGHT and stats_map[name]["continuous_night"] >= MAX_CONTINUOUS_NIGHT:
         return False
+    if shift == SHIFT_NIGHT and stats_map[name]["prev_shift"] != SHIFT_NIGHT and stats_map[name]["month_night_blocks"] >= 1:
+        return False
     return True
 
 
@@ -2001,11 +2022,26 @@ def assign_shift_with_sync(
     warnings: List[dict],
 ):
     for primary in selected_names:
+        shift_cap = daily_shift_cap(shift)
+        current_shift_count = sum(member_schedule.get(dt) == shift for member_schedule in schedule.values())
+        if shift_cap is not None and current_shift_count >= shift_cap:
+            warnings.append({
+                "date": dt.isoformat(),
+                "warning": f"{shift} reached the maximum allowed {shift_cap} resources, so {primary} was not assigned.",
+            })
+            continue
         if not can_assign_shift(primary, shift, dt, schedule, stats_map, member_map):
             continue
         schedule[primary][dt] = shift
         shift_counts[shift][primary] += 1
         for follower in sync_groups.get(primary, []):
+            current_shift_count = sum(member_schedule.get(dt) == shift for member_schedule in schedule.values())
+            if shift_cap is not None and current_shift_count >= shift_cap:
+                warnings.append({
+                    "date": dt.isoformat(),
+                    "warning": f"Sync not possible: {follower} could not match {primary}'s {shift} shift because the daily {shift} limit of {shift_cap} was reached.",
+                })
+                continue
             if can_assign_shift(follower, shift, dt, schedule, stats_map, member_map):
                 schedule[follower][dt] = shift
                 shift_counts[shift][follower] += 1
@@ -2047,7 +2083,15 @@ def style_matrix(df: pd.DataFrame, bank_holidays: Set[date]):
     return styled
 
 
-def to_excel_bytes(matrix_df: pd.DataFrame, full_df: pd.DataFrame, daywise_df: pd.DataFrame, summary_df: pd.DataFrame, warnings_df: pd.DataFrame, bank_holidays: Set[date]) -> bytes:
+def to_excel_bytes(
+    matrix_df: pd.DataFrame,
+    full_df: pd.DataFrame,
+    daywise_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    warnings_df: pd.DataFrame,
+    validation_df: pd.DataFrame,
+    bank_holidays: Set[date],
+) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         matrix_df.to_excel(writer, index=False, sheet_name="ROTA Matrix")
@@ -2055,6 +2099,7 @@ def to_excel_bytes(matrix_df: pd.DataFrame, full_df: pd.DataFrame, daywise_df: p
         daywise_df.to_excel(writer, index=False, sheet_name="Day Wise Schedule")
         summary_df.to_excel(writer, index=False, sheet_name="Summary")
         warnings_df.to_excel(writer, index=False, sheet_name="Warnings")
+        validation_df.to_excel(writer, index=False, sheet_name="Validation Report")
 
         for sheet_name, df in {
             "ROTA Matrix": matrix_df,
@@ -2062,6 +2107,7 @@ def to_excel_bytes(matrix_df: pd.DataFrame, full_df: pd.DataFrame, daywise_df: p
             "Day Wise Schedule": daywise_df,
             "Summary": summary_df,
             "Warnings": warnings_df,
+            "Validation Report": validation_df,
         }.items():
             ws = writer.sheets[sheet_name]
             for cell in ws[1]:
@@ -2267,6 +2313,306 @@ def build_rota_views_from_full_df(full_df: pd.DataFrame, bank_holidays: Set[date
     return pd.DataFrame(matrix_rows), pd.DataFrame(daywise_rows), pd.DataFrame(summary_rows)
 
 
+def derive_sync_groups_from_full_df(full_df: pd.DataFrame) -> Dict[str, List[str]]:
+    if full_df.empty or "name" not in full_df.columns or "primary_for" not in full_df.columns:
+        return {}
+
+    sync_groups: Dict[str, List[str]] = {}
+    for _, row in full_df.iterrows():
+        primary = normalize_text_input(row.get("name", ""))
+        followers = dedupe_member_names(normalize_text_input(row.get("primary_for", "")).split(","), exclude=primary)
+        if primary and followers:
+            sync_groups[primary] = followers
+    return sync_groups
+
+
+def empty_validation_report_df(message: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "severity": "Info",
+                "scope": "Validation",
+                "subject": "",
+                "date": "",
+                "rule": "Validation snapshot",
+                "details": message,
+            }
+        ]
+    )
+
+
+def build_rota_validation_report(
+    full_df: pd.DataFrame,
+    bank_holidays: Set[date],
+    start_date: date,
+    end_date: date,
+    global_weekoffs_per_month: int | None = None,
+    afternoon_only_names: Set[str] | None = None,
+    sync_groups: Dict[str, List[str]] | None = None,
+) -> pd.DataFrame:
+    if full_df.empty:
+        return empty_validation_report_df("No rota data is available to validate.")
+
+    normalized_full_df = normalize_full_rota_df(full_df)
+    date_cols = extract_date_columns(normalized_full_df)
+    if not date_cols:
+        return empty_validation_report_df("No rota date columns were found in the saved schedule.")
+
+    dates = [datetime.strptime(col, "%Y-%m-%d").date() for col in date_cols]
+    afternoon_only_names = {normalize_text_input(name) for name in (afternoon_only_names or set()) if normalize_text_input(name)}
+    sync_groups = sync_groups or derive_sync_groups_from_full_df(normalized_full_df)
+    row_lookup = {
+        normalize_text_input(row.get("name", "")): row
+        for _, row in normalized_full_df.iterrows()
+        if normalize_text_input(row.get("name", ""))
+    }
+    issues: List[dict] = []
+    allowed_shifts = set(SHIFT_CODE_MAP.keys()) - {SHIFT_UNASSIGNED}
+    target_weekoffs = (
+        sum(prorated_target(int(global_weekoffs_per_month), start_date, end_date).values())
+        if global_weekoffs_per_month is not None
+        else None
+    )
+
+    def add_issue(severity: str, scope: str, subject: str, issue_date: date | str | None, rule: str, details: str):
+        if isinstance(issue_date, date):
+            date_value = issue_date.isoformat()
+        else:
+            date_value = normalize_text_input(issue_date)
+        issues.append(
+            {
+                "severity": severity,
+                "scope": scope,
+                "subject": subject,
+                "date": date_value,
+                "rule": rule,
+                "details": details,
+            }
+        )
+
+    for col, dt in zip(date_cols, dates):
+        counts = normalized_full_df[col].value_counts(dropna=False).to_dict()
+        for shift_name, minimum in (
+            (SHIFT_MORNING, MIN_MORNING),
+            (SHIFT_AFTERNOON, MIN_AFTERNOON),
+            (SHIFT_NIGHT, MIN_NIGHT),
+        ):
+            assigned = int(counts.get(shift_name, 0))
+            if assigned < minimum:
+                add_issue(
+                    "Error",
+                    "Daily Staffing",
+                    shift_name,
+                    dt,
+                    f"Minimum {shift_name} coverage",
+                    f"{dt.isoformat()} has {assigned} {shift_name} assignments, below the required minimum of {minimum}.",
+                )
+
+        for shift_name, maximum in ((SHIFT_MORNING, MAX_MORNING), (SHIFT_NIGHT, MAX_NIGHT)):
+            assigned = int(counts.get(shift_name, 0))
+            if assigned > maximum:
+                add_issue(
+                    "Error",
+                    "Daily Staffing",
+                    shift_name,
+                    dt,
+                    f"Maximum {shift_name} capacity",
+                    f"{dt.isoformat()} has {assigned} {shift_name} assignments, above the allowed maximum of {maximum}.",
+                )
+
+        if is_restricted_staffing_day(dt, bank_holidays):
+            for shift_name in (SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT):
+                assigned = int(counts.get(shift_name, 0))
+                if assigned > 2:
+                    add_issue(
+                        "Warning",
+                        "Restricted Day",
+                        shift_name,
+                        dt,
+                        "Weekend or bank-holiday preferred staffing",
+                        f"{dt.isoformat()} has {assigned} {shift_name} assignments. Restricted days should stay at 2 per shift unless an approved exception is needed.",
+                    )
+
+    for member_name, row in row_lookup.items():
+        shifts = [row.get(col, SHIFT_WEEKOFF) for col in date_cols]
+        shift_pairs = list(zip(dates, shifts))
+
+        for dt, shift_name in shift_pairs:
+            if shift_name not in allowed_shifts and shift_name != SHIFT_UNASSIGNED:
+                add_issue(
+                    "Error",
+                    "Member",
+                    member_name,
+                    dt,
+                    "Supported shift values",
+                    f"{member_name} has an unsupported shift value `{shift_name}` on {dt.isoformat()}.",
+                )
+
+        weekoff_count = sum(1 for shift_name in shifts if shift_name == SHIFT_WEEKOFF)
+        if target_weekoffs is not None and weekoff_count != target_weekoffs:
+            add_issue(
+                "Error",
+                "Member",
+                member_name,
+                "",
+                "Week Off target",
+                f"{member_name} has {weekoff_count} Week Off days in the window, but the target is {target_weekoffs}.",
+            )
+
+        if member_name in afternoon_only_names:
+            for dt, shift_name in shift_pairs:
+                if dt.weekday() >= 5 and is_working_shift(shift_name):
+                    add_issue(
+                        "Error",
+                        "Member",
+                        member_name,
+                        dt,
+                        "Afternoon-only weekend rule",
+                        f"{member_name} is marked as afternoon-only but is working on the restricted day {dt.isoformat()}.",
+                    )
+                elif dt.weekday() < 5 and shift_name in {SHIFT_MORNING, SHIFT_NIGHT}:
+                    add_issue(
+                        "Error",
+                        "Member",
+                        member_name,
+                        dt,
+                        "Afternoon-only weekday rule",
+                        f"{member_name} is marked as afternoon-only but has a {shift_name} assignment on {dt.isoformat()}.",
+                    )
+
+        max_work_run = 0
+        run_start_index = 0
+        scan = 0
+        while scan < len(shifts):
+            if not is_working_shift(shifts[scan]):
+                scan += 1
+                continue
+            run_start_index = scan
+            while scan + 1 < len(shifts) and is_working_shift(shifts[scan + 1]):
+                scan += 1
+            run_length = scan - run_start_index + 1
+            max_work_run = max(max_work_run, run_length)
+            if run_length > MAX_CONTINUOUS_WORKING_DAYS:
+                add_issue(
+                    "Error",
+                    "Member",
+                    member_name,
+                    dates[run_start_index],
+                    "Maximum continuous working days",
+                    f"{member_name} works continuously from {dates[run_start_index].isoformat()} to {dates[scan].isoformat()} ({run_length} days), above the allowed {MAX_CONTINUOUS_WORKING_DAYS}.",
+                )
+            scan += 1
+
+        monthly_night_blocks: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+        night_shift_count = 0
+        idx = 0
+        while idx < len(shifts):
+            if shifts[idx] != SHIFT_NIGHT:
+                idx += 1
+                continue
+            block_start = idx
+            while idx + 1 < len(shifts) and shifts[idx + 1] == SHIFT_NIGHT:
+                idx += 1
+            block_end = idx
+            block_dates = dates[block_start:block_end + 1]
+            night_shift_count += len(block_dates)
+
+            if month_key(block_dates[0]) != month_key(block_dates[-1]):
+                add_issue(
+                    "Error",
+                    "Member",
+                    member_name,
+                    block_dates[0],
+                    "Night block month boundary",
+                    f"{member_name} has a Night block that crosses from {block_dates[0].isoformat()} to {block_dates[-1].isoformat()}, which must be split by month.",
+                )
+
+            monthly_night_blocks.setdefault(month_key(block_dates[0]), []).append((block_start, block_end))
+
+            if len(block_dates) > MAX_CONTINUOUS_NIGHT:
+                add_issue(
+                    "Error",
+                    "Member",
+                    member_name,
+                    block_dates[0],
+                    "Maximum continuous Night shifts",
+                    f"{member_name} has a Night block from {block_dates[0].isoformat()} to {block_dates[-1].isoformat()} ({len(block_dates)} days), above the allowed {MAX_CONTINUOUS_NIGHT}.",
+                )
+
+            follow_up_dates = dates[block_end + 1:block_end + 1 + MANDATORY_OFF_AFTER_NIGHT]
+            for off_dt in follow_up_dates:
+                off_shift = row.get(off_dt.isoformat(), SHIFT_UNASSIGNED)
+                if off_shift != SHIFT_WEEKOFF and not is_leave_like_shift(off_shift):
+                    add_issue(
+                        "Error",
+                        "Member",
+                        member_name,
+                        off_dt,
+                        "Post-Night mandatory rest",
+                        f"{member_name} has {off_shift} on {off_dt.isoformat()} immediately after a Night block. The next {MANDATORY_OFF_AFTER_NIGHT} days must stay as Week Off or Leave.",
+                    )
+                    break
+            idx += 1
+
+        if member_name not in afternoon_only_names and night_shift_count == 0:
+            add_issue(
+                "Error",
+                "Member",
+                member_name,
+                "",
+                "Night block allocation",
+                f"{member_name} does not have any Night shift in the selected schedule window.",
+            )
+
+        for month, blocks in monthly_night_blocks.items():
+            if len(blocks) > 1:
+                block_labels = ", ".join(
+                    f"{dates[start_idx].isoformat()} to {dates[end_idx].isoformat()}"
+                    for start_idx, end_idx in blocks
+                )
+                add_issue(
+                    "Error",
+                    "Member",
+                    member_name,
+                    f"{month[0]}-{month[1]:02d}",
+                    "Single Night block per month",
+                    f"{member_name} has {len(blocks)} Night blocks in {month[0]}-{month[1]:02d}: {block_labels}. Only one continuous Night block is allowed per month.",
+                )
+
+    for primary, followers in sync_groups.items():
+        primary_row = row_lookup.get(normalize_text_input(primary))
+        if primary_row is None:
+            continue
+        for follower in followers:
+            follower_row = row_lookup.get(normalize_text_input(follower))
+            if follower_row is None:
+                continue
+            mismatches = [dt for dt in dates if primary_row.get(dt.isoformat()) != follower_row.get(dt.isoformat())]
+            if mismatches:
+                preview = ", ".join(dt.isoformat() for dt in mismatches[:4])
+                extra_suffix = "" if len(mismatches) <= 4 else f", and {len(mismatches) - 4} more"
+                add_issue(
+                    "Warning",
+                    "Sync Group",
+                    f"{primary} -> {follower}",
+                    mismatches[0],
+                    "Follower alignment",
+                    f"{primary} and {follower} differ on {len(mismatches)} dates: {preview}{extra_suffix}.",
+                )
+
+    if not issues:
+        return empty_validation_report_df("No validation issues were found for the current rota snapshot.")
+
+    severity_order = {"Error": 0, "Warning": 1, "Info": 2}
+    validation_df = pd.DataFrame(issues)
+    validation_df["_severity_order"] = validation_df["severity"].map(severity_order).fillna(9)
+    validation_df = validation_df.sort_values(
+        by=["_severity_order", "date", "scope", "subject", "rule"],
+        ascending=[True, True, True, True, True],
+    ).drop(columns=["_severity_order"]).reset_index(drop=True)
+    return validation_df
+
+
 def build_override_warnings(full_df: pd.DataFrame) -> pd.DataFrame:
     warnings: List[dict] = []
     date_cols = extract_date_columns(full_df)
@@ -2283,15 +2629,46 @@ def save_overridden_rota(full_df: pd.DataFrame, metadata: dict, bank_holidays: S
     normalized_full_df = normalize_full_rota_df(full_df)
     matrix_df, daywise_df, summary_df = build_rota_views_from_full_df(normalized_full_df, bank_holidays)
     warnings_df = build_override_warnings(normalized_full_df)
-    excel_bytes = to_excel_bytes(matrix_df, normalized_full_df, daywise_df, summary_df, warnings_df, bank_holidays)
-
-    start_date = date.fromisoformat(metadata.get("start_date", extract_date_columns(normalized_full_df)[0]))
-    end_date = date.fromisoformat(metadata.get("end_date", extract_date_columns(normalized_full_df)[-1]))
-    save_generated_rota(matrix_df, normalized_full_df, daywise_df, summary_df, warnings_df, bank_holidays, start_date, end_date, excel_bytes)
-
+    date_cols = extract_date_columns(normalized_full_df)
+    start_date = date.fromisoformat(metadata.get("start_date", date_cols[0]))
+    end_date = date.fromisoformat(metadata.get("end_date", date_cols[-1]))
+    raw_weekoffs = metadata.get("weekoffs_per_month")
+    try:
+        weekoffs_per_month = int(raw_weekoffs) if raw_weekoffs is not None else None
+    except (TypeError, ValueError):
+        weekoffs_per_month = None
+    afternoon_only_names = {
+        normalize_text_input(name)
+        for name in metadata.get("afternoon_only_names", [])
+        if normalize_text_input(name)
+    }
+    sync_groups = metadata.get("sync_groups")
+    if not isinstance(sync_groups, dict):
+        sync_groups = derive_sync_groups_from_full_df(normalized_full_df)
+    validation_df = build_rota_validation_report(
+        normalized_full_df,
+        bank_holidays,
+        start_date=start_date,
+        end_date=end_date,
+        global_weekoffs_per_month=weekoffs_per_month,
+        afternoon_only_names=afternoon_only_names,
+        sync_groups=sync_groups,
+    )
+    excel_bytes = to_excel_bytes(matrix_df, normalized_full_df, daywise_df, summary_df, warnings_df, validation_df, bank_holidays)
     updated_metadata = dict(metadata)
     updated_metadata["saved_at"] = datetime.utcnow().isoformat(timespec="seconds")
     updated_metadata["manual_override"] = True
+    save_generated_rota(
+        matrix_df,
+        normalized_full_df,
+        daywise_df,
+        summary_df,
+        warnings_df,
+        validation_df,
+        bank_holidays,
+        updated_metadata,
+        excel_bytes,
+    )
 
     return {
         "metadata": updated_metadata,
@@ -2300,6 +2677,7 @@ def save_overridden_rota(full_df: pd.DataFrame, metadata: dict, bank_holidays: S
         "daywise_df": daywise_df,
         "summary_df": summary_df,
         "warnings_df": warnings_df,
+        "validation_df": validation_df,
         "bank_holidays": bank_holidays,
         "excel_bytes": excel_bytes,
     }
@@ -2504,17 +2882,32 @@ def parse_preassigned_shifts(
 
     for shift_date, counts in fixed_day_counts.items():
         if is_restricted_staffing_day(shift_date, bank_holidays):
-            for shift_name in [SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT]:
-                if counts[shift_name] > 2:
-                    raise ValueError(
-                        f"{shift_date.isoformat()} already has {counts[shift_name]} fixed {shift_name} assignments. "
-                        "Restricted days can only keep 2 members per shift unless the day is adjusted manually after generation."
-                    )
-        elif counts[SHIFT_NIGHT] > 3:
-            raise ValueError(
-                f"{shift_date.isoformat()} already has {counts[SHIFT_NIGHT]} fixed Night assignments. "
-                "Weekdays can temporarily go to 3 Night resources, but not beyond that."
-            )
+            if counts[SHIFT_AFTERNOON] > 2:
+                raise ValueError(
+                    f"{shift_date.isoformat()} already has {counts[SHIFT_AFTERNOON]} fixed Afternoon assignments. "
+                    "Restricted days can only keep 2 Afternoon members unless the day is adjusted manually after generation."
+                )
+            if counts[SHIFT_MORNING] > MAX_MORNING:
+                raise ValueError(
+                    f"{shift_date.isoformat()} already has {counts[SHIFT_MORNING]} fixed Morning assignments. "
+                    f"Morning can temporarily go to {MAX_MORNING} resources, but not beyond that."
+                )
+            if counts[SHIFT_NIGHT] > MAX_NIGHT:
+                raise ValueError(
+                    f"{shift_date.isoformat()} already has {counts[SHIFT_NIGHT]} fixed Night assignments. "
+                    f"Night can temporarily go to {MAX_NIGHT} resources, but not beyond that."
+                )
+        else:
+            if counts[SHIFT_MORNING] > MAX_MORNING:
+                raise ValueError(
+                    f"{shift_date.isoformat()} already has {counts[SHIFT_MORNING]} fixed Morning assignments. "
+                    f"Morning can temporarily go to {MAX_MORNING} resources, but not beyond that."
+                )
+            if counts[SHIFT_NIGHT] > MAX_NIGHT:
+                raise ValueError(
+                    f"{shift_date.isoformat()} already has {counts[SHIFT_NIGHT]} fixed Night assignments. "
+                    f"Night can temporarily go to {MAX_NIGHT} resources, but not beyond that."
+                )
 
     return {name: assignments for name, assignments in expanded.items() if assignments}
 
@@ -2641,7 +3034,9 @@ def parse_manual_rota_upload_df(
 
 
 def save_manual_uploaded_rota(full_df: pd.DataFrame, metadata: dict, bank_holidays: Set[date]) -> dict:
-    updated_bundle = save_overridden_rota(full_df, metadata, bank_holidays)
+    upload_metadata = dict(metadata)
+    upload_metadata["manual_upload"] = True
+    updated_bundle = save_overridden_rota(full_df, upload_metadata, bank_holidays)
     updated_bundle["metadata"]["manual_upload"] = True
     return updated_bundle
 
@@ -2843,18 +3238,6 @@ def generate_rota(
                     if n not in continuing_night
                     and stats_map[n]["prev_shift"] != SHIFT_NIGHT
                     and stats_map[n]["month_night_blocks"] == 0
-                ]
-            if len(starter_pool) < remaining_after_continuity:
-                starter_pool = [
-                    n for n in fallback_pool
-                    if n not in continuing_night
-                    and n not in follower_to_primary
-                    and stats_map[n]["prev_shift"] != SHIFT_NIGHT
-                ]
-            if len(starter_pool) < remaining_after_continuity:
-                starter_pool = [
-                    n for n in fallback_pool
-                    if n not in continuing_night and stats_map[n]["prev_shift"] != SHIFT_NIGHT
                 ]
 
             night_selected = continuing_night[:remaining_night_need]
@@ -3299,6 +3682,7 @@ def render_dev_console(
     preassigned_shifts_df: pd.DataFrame,
     start_date: date,
     end_date: date,
+    weekoffs_per_month: int,
     bank_holiday_mode: str,
     auto_bank_holiday_days: int,
     specific_bank_holiday_df: pd.DataFrame,
@@ -3466,6 +3850,9 @@ def render_dev_console(
                             metadata = {
                                 "start_date": start_date.isoformat(),
                                 "end_date": end_date.isoformat(),
+                                "weekoffs_per_month": int(weekoffs_per_month),
+                                "afternoon_only_names": sorted([member.name for member in members if member.afternoon_only]),
+                                "sync_groups": {primary: list(followers) for primary, followers in current_sync_groups.items()},
                             }
                             updated_bundle = save_manual_uploaded_rota(parsed_manual_rota_df, metadata, manual_bank_holidays)
                             st.session_state["rota_bundle"] = updated_bundle
@@ -4271,6 +4658,7 @@ with st.sidebar:
             - Morning: 2
             - Afternoon: 2
             - Night: 2
+            - Morning may temporarily go to 3 when needed, but never beyond 3
             - Night may temporarily go to 3 on non-restricted days only when needed so every eligible member can still receive a Night block
 
             **Scheduling Rules**
@@ -4558,20 +4946,33 @@ if can_manage:
                 sync_groups=sync_groups,
                 preassigned_shifts=preassigned_shifts,
             )
-            excel_bytes = to_excel_bytes(matrix_df, full_df, daywise_df, summary_df, warnings_df, bank_holidays)
-            save_generated_rota(matrix_df, full_df, daywise_df, summary_df, warnings_df, bank_holidays, start_date, end_date, excel_bytes)
+            metadata = {
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "weekoffs_per_month": int(weekoffs_per_month),
+                "afternoon_only_names": sorted([member.name for member in members if member.afternoon_only]),
+                "sync_groups": {primary: list(followers) for primary, followers in sync_groups.items()},
+            }
+            validation_df = build_rota_validation_report(
+                full_df,
+                bank_holidays,
+                start_date=start_date,
+                end_date=end_date,
+                global_weekoffs_per_month=int(weekoffs_per_month),
+                afternoon_only_names=set(metadata["afternoon_only_names"]),
+                sync_groups=sync_groups,
+            )
+            excel_bytes = to_excel_bytes(matrix_df, full_df, daywise_df, summary_df, warnings_df, validation_df, bank_holidays)
+            save_generated_rota(matrix_df, full_df, daywise_df, summary_df, warnings_df, validation_df, bank_holidays, metadata, excel_bytes)
 
             rota_bundle = {
-                "metadata": {
-                    "saved_at": datetime.utcnow().isoformat(timespec="seconds"),
-                    "start_date": start_date.isoformat(),
-                    "end_date": end_date.isoformat(),
-                },
+                "metadata": {**metadata, "saved_at": datetime.utcnow().isoformat(timespec="seconds")},
                 "matrix_df": matrix_df,
                 "full_df": full_df,
                 "daywise_df": daywise_df,
                 "summary_df": summary_df,
                 "warnings_df": warnings_df,
+                "validation_df": validation_df,
                 "bank_holidays": bank_holidays,
                 "excel_bytes": excel_bytes,
             }
@@ -4589,8 +4990,42 @@ if rota_bundle is None:
 
 if rota_bundle is None and saved_rota is not None:
     try:
+        saved_validation_df = saved_rota.get("validation_df", pd.DataFrame())
+        if saved_validation_df is None or saved_validation_df.empty:
+            saved_date_cols = extract_date_columns(saved_rota["full_df"])
+            saved_metadata = saved_rota.get("metadata", {})
+            saved_start_date = date.fromisoformat(saved_metadata.get("start_date", saved_date_cols[0]))
+            saved_end_date = date.fromisoformat(saved_metadata.get("end_date", saved_date_cols[-1]))
+            raw_saved_weekoffs = saved_metadata.get("weekoffs_per_month")
+            try:
+                saved_weekoffs = int(raw_saved_weekoffs) if raw_saved_weekoffs is not None else None
+            except (TypeError, ValueError):
+                saved_weekoffs = None
+            saved_afternoon_only_names = {
+                normalize_text_input(name)
+                for name in saved_metadata.get("afternoon_only_names", [])
+                if normalize_text_input(name)
+            }
+            saved_sync_groups = saved_metadata.get("sync_groups")
+            if not isinstance(saved_sync_groups, dict):
+                saved_sync_groups = derive_sync_groups_from_full_df(saved_rota["full_df"])
+            saved_validation_df = build_rota_validation_report(
+                saved_rota["full_df"],
+                saved_rota["bank_holidays"],
+                start_date=saved_start_date,
+                end_date=saved_end_date,
+                global_weekoffs_per_month=saved_weekoffs,
+                afternoon_only_names=saved_afternoon_only_names,
+                sync_groups=saved_sync_groups,
+            )
         excel_bytes = ROTA_EXCEL_FILE.read_bytes() if ROTA_EXCEL_FILE.exists() else to_excel_bytes(
-            saved_rota["matrix_df"], saved_rota["full_df"], saved_rota["daywise_df"], saved_rota["summary_df"], saved_rota["warnings_df"], saved_rota["bank_holidays"]
+            saved_rota["matrix_df"],
+            saved_rota["full_df"],
+            saved_rota["daywise_df"],
+            saved_rota["summary_df"],
+            saved_rota["warnings_df"],
+            saved_validation_df,
+            saved_rota["bank_holidays"],
         )
         rota_bundle = {
             "metadata": saved_rota["metadata"],
@@ -4599,6 +5034,7 @@ if rota_bundle is None and saved_rota is not None:
             "daywise_df": saved_rota["daywise_df"],
             "summary_df": saved_rota["summary_df"],
             "warnings_df": saved_rota["warnings_df"],
+            "validation_df": saved_validation_df,
             "bank_holidays": saved_rota["bank_holidays"],
             "excel_bytes": excel_bytes,
         }
@@ -4612,6 +5048,7 @@ if rota_bundle is not None:
     daywise_df = rota_bundle["daywise_df"]
     summary_df = rota_bundle["summary_df"]
     warnings_df = rota_bundle["warnings_df"]
+    validation_df = rota_bundle.get("validation_df", empty_validation_report_df("No validation snapshot is available for this rota yet."))
     bank_holidays = rota_bundle["bank_holidays"]
     excel_bytes = rota_bundle["excel_bytes"]
     csv_bytes = matrix_df.to_csv(index=False).encode("utf-8")
@@ -4625,8 +5062,21 @@ if rota_bundle is not None:
         "Review the saved rota outputs, switch between schedule views, and export the latest snapshot when needed.",
     )
 
+    validation_issue_count = 0
+    validation_error_count = 0
+    validation_warning_count = 0
+    if not validation_df.empty:
+        validation_issue_count = int((validation_df["severity"] != "Info").sum()) if "severity" in validation_df.columns else 0
+        validation_error_count = int((validation_df["severity"] == "Error").sum()) if "severity" in validation_df.columns else 0
+        validation_warning_count = int((validation_df["severity"] == "Warning").sum()) if "severity" in validation_df.columns else 0
+
+    if validation_error_count:
+        render_inline_note("warning", "Validation issues found", f"The current rota has {validation_error_count} errors and {validation_warning_count} warnings in the validation report.")
+    elif validation_warning_count:
+        render_inline_note("info", "Validation report ready", f"The current rota has {validation_warning_count} validation warnings and no blocking errors.")
+
     if can_manage:
-        tab_names = ["ROTA Matrix", "Full Shift Names", "Day Wise Schedule", "Summary", "Warnings", "Change Support Availability", "Manual Overrides", "Dev Console"]
+        tab_names = ["ROTA Matrix", "Full Shift Names", "Day Wise Schedule", "Summary", "Validation Report", "Warnings", "Change Support Availability", "Manual Overrides", "Dev Console"]
     else:
         tab_names = ["ROTA Matrix", "Change Support Availability"]
     tabs = st.tabs(tab_names)
@@ -4645,11 +5095,21 @@ if rota_bundle is not None:
             st.dataframe(summary_df, width="stretch", hide_index=True)
 
         with tabs[4]:
+            metric_a, metric_b, metric_c = st.columns(3)
+            with metric_a:
+                st.metric("Total issues", validation_issue_count)
+            with metric_b:
+                st.metric("Errors", validation_error_count)
+            with metric_c:
+                st.metric("Warnings", validation_warning_count)
+            st.dataframe(validation_df, width="stretch", hide_index=True)
+
+        with tabs[5]:
             st.dataframe(warnings_df, width="stretch", hide_index=True)
 
-        change_tab = tabs[5]
-        override_tab = tabs[6]
-        dev_tab = tabs[7]
+        change_tab = tabs[6]
+        override_tab = tabs[7]
+        dev_tab = tabs[8]
     else:
         change_tab = tabs[1]
         override_tab = None
@@ -4761,6 +5221,7 @@ if rota_bundle is not None:
                 preassigned_shifts_df=preassigned_df,
                 start_date=start_date,
                 end_date=end_date,
+                weekoffs_per_month=int(weekoffs_per_month),
                 bank_holiday_mode=bh_mode,
                 auto_bank_holiday_days=int(auto_bh_days),
                 specific_bank_holiday_df=specific_bh_df,
@@ -4794,6 +5255,7 @@ else:
             preassigned_shifts_df=preassigned_df,
             start_date=start_date,
             end_date=end_date,
+            weekoffs_per_month=int(weekoffs_per_month),
             bank_holiday_mode=bh_mode,
             auto_bank_holiday_days=int(auto_bh_days),
             specific_bank_holiday_df=specific_bh_df,
