@@ -8,6 +8,7 @@ from datetime import date, datetime, time, timedelta
 from html import escape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
@@ -32,7 +33,10 @@ LEAVE_EDITOR_KEY = "leave_editor_v2"
 BH_EDITOR_KEY = "bh_editor_v2"
 SYNC_GROUPS_EDITOR_KEY = "sync_groups_editor_v2"
 PREASSIGNED_EDITOR_KEY = "preassigned_shifts_editor_v2"
-DATE_INPUT_REGEX = r"^$|^\d{4}-\d{2}-\d{2}$"
+LEAVE_ENTRIES_STATE = "leave_entries_state"
+BANK_HOLIDAY_ENTRIES_STATE = "bank_holiday_entries_state"
+SYNC_GROUP_ENTRIES_STATE = "sync_group_entries_state"
+PREASSIGNED_ENTRIES_STATE = "preassigned_entries_state"
 
 SHIFT_MORNING = "Morning"
 SHIFT_AFTERNOON = "Afternoon"
@@ -241,13 +245,590 @@ def ensure_date_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     return df
 
 
-def prepare_date_editor_df(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    normalized_df = ensure_date_columns(df, cols)
-    for col in cols:
-        normalized_df[col] = normalized_df[col].apply(
-            lambda value: value.date().isoformat() if not pd.isna(value) else ""
+def normalize_text_input(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    cleaned = str(value).strip()
+    return "" if cleaned.lower() in {"nan", "nat", "none"} else cleaned
+
+
+def coerce_optional_date(value: Any) -> Optional[date]:
+    cleaned = normalize_text_input(value)
+    if not cleaned:
+        return None
+    return pd.to_datetime(cleaned).date()
+
+
+def make_entry_id() -> str:
+    return uuid4().hex[:10]
+
+
+def member_options_from_df(team_df: pd.DataFrame) -> List[str]:
+    if "name" not in team_df.columns:
+        return []
+
+    options: List[str] = []
+    seen: Set[str] = set()
+    for raw_name in team_df["name"].tolist():
+        name = normalize_text_input(raw_name)
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        options.append(name)
+    return options
+
+
+def ensure_entries_state(state_key: str, default_rows: List[dict]) -> List[dict]:
+    if state_key not in st.session_state or not isinstance(st.session_state[state_key], list):
+        st.session_state[state_key] = [dict(row) for row in default_rows]
+    return [dict(row) for row in st.session_state[state_key]]
+
+
+def leave_entries_from_df(df: pd.DataFrame) -> List[dict]:
+    if df is None or df.empty:
+        return []
+
+    normalized_df = ensure_date_columns(df, ["leave_start_date", "leave_end_date"])
+    rows: List[dict] = []
+    for _, row in normalized_df.iterrows():
+        name = normalize_text_input(row.get("name", ""))
+        start_dt = coerce_optional_date(row.get("leave_start_date"))
+        end_dt = coerce_optional_date(row.get("leave_end_date"))
+        if not name and start_dt is None and end_dt is None:
+            continue
+        if not name or start_dt is None or end_dt is None:
+            continue
+        rows.append(
+            {
+                "id": make_entry_id(),
+                "name": name,
+                "leave_start_date": start_dt,
+                "leave_end_date": end_dt,
+            }
         )
-    return normalized_df
+    return rows
+
+
+def leave_entries_to_df(rows: List[dict]) -> pd.DataFrame:
+    records = [
+        {
+            "name": normalize_text_input(row.get("name", "")),
+            "leave_start_date": row.get("leave_start_date"),
+            "leave_end_date": row.get("leave_end_date"),
+        }
+        for row in rows
+        if normalize_text_input(row.get("name", "")) and row.get("leave_start_date") and row.get("leave_end_date")
+    ]
+    return ensure_date_columns(pd.DataFrame(records, columns=["name", "leave_start_date", "leave_end_date"]), ["leave_start_date", "leave_end_date"])
+
+
+def bank_holiday_entries_from_df(df: pd.DataFrame) -> List[dict]:
+    if df is None or df.empty:
+        return []
+
+    normalized_df = ensure_date_columns(df, ["bank_holiday_date"])
+    rows: List[dict] = []
+    for _, row in normalized_df.iterrows():
+        holiday_dt = coerce_optional_date(row.get("bank_holiday_date"))
+        if holiday_dt is None:
+            continue
+        rows.append({"id": make_entry_id(), "bank_holiday_date": holiday_dt})
+    return rows
+
+
+def bank_holiday_entries_to_df(rows: List[dict]) -> pd.DataFrame:
+    records = [
+        {"bank_holiday_date": row.get("bank_holiday_date")}
+        for row in rows
+        if row.get("bank_holiday_date")
+    ]
+    return ensure_date_columns(pd.DataFrame(records, columns=["bank_holiday_date"]), ["bank_holiday_date"])
+
+
+def preassigned_entries_from_df(df: pd.DataFrame) -> List[dict]:
+    if df is None or df.empty:
+        return []
+
+    normalized_df = normalize_preassigned_shifts_df(df)
+    rows: List[dict] = []
+    for _, row in normalized_df.iterrows():
+        name = normalize_text_input(row.get("name", ""))
+        start_dt = coerce_optional_date(row.get("start_date"))
+        end_dt = coerce_optional_date(row.get("end_date"))
+        fixed_shift = normalize_text_input(row.get("fixed_shift", ""))
+        if not name and start_dt is None and end_dt is None and not fixed_shift:
+            continue
+        if not name or start_dt is None or not fixed_shift:
+            continue
+        rows.append(
+            {
+                "id": make_entry_id(),
+                "name": name,
+                "start_date": start_dt,
+                "end_date": end_dt,
+                "fixed_shift": fixed_shift,
+            }
+        )
+    return rows
+
+
+def preassigned_entries_to_df(rows: List[dict]) -> pd.DataFrame:
+    records = [
+        {
+            "name": normalize_text_input(row.get("name", "")),
+            "start_date": row.get("start_date"),
+            "end_date": row.get("end_date"),
+            "fixed_shift": normalize_text_input(row.get("fixed_shift", "")),
+        }
+        for row in rows
+        if normalize_text_input(row.get("name", "")) and row.get("start_date") and normalize_text_input(row.get("fixed_shift", ""))
+    ]
+    return normalize_preassigned_shifts_df(pd.DataFrame(records, columns=PREASSIGNED_SHIFT_COLUMNS))
+
+
+def selectbox_options_for_value(options: List[str], current_value: str) -> List[str]:
+    cleaned_value = normalize_text_input(current_value)
+    resolved_options = [""] + options
+    if cleaned_value and cleaned_value not in resolved_options:
+        resolved_options.insert(1, cleaned_value)
+    return resolved_options
+
+
+def dedupe_member_names(values: List[Any], exclude: str = "") -> List[str]:
+    excluded_value = normalize_text_input(exclude).lower()
+    deduped: List[str] = []
+    seen: Set[str] = set()
+    for raw_value in values:
+        name = normalize_text_input(raw_value)
+        lowered = name.lower()
+        if not name or lowered == excluded_value or lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(name)
+    return deduped
+
+
+def sync_group_entries_from_df(df: pd.DataFrame) -> List[dict]:
+    if df is None or df.empty or "sync_group" not in df.columns:
+        return []
+
+    rows: List[dict] = []
+    for _, row in df.iterrows():
+        raw_group = normalize_text_input(row.get("sync_group", ""))
+        if not raw_group:
+            continue
+        members = dedupe_member_names(raw_group.split(","))
+        if len(members) < 2:
+            continue
+        rows.append(
+            {
+                "id": make_entry_id(),
+                "primary": members[0],
+                "followers": members[1:],
+            }
+        )
+    return rows
+
+
+def sync_group_entries_to_df(rows: List[dict]) -> pd.DataFrame:
+    records = []
+    for row in rows:
+        primary = normalize_text_input(row.get("primary", ""))
+        followers = dedupe_member_names(row.get("followers", []), exclude=primary)
+        if not primary or not followers:
+            continue
+        records.append({"sync_group": ", ".join([primary] + followers)})
+    return pd.DataFrame(records, columns=["sync_group"])
+
+
+def render_leave_entries_editor(team_df: pd.DataFrame, default_df: pd.DataFrame, window_start: date, window_end: date) -> pd.DataFrame:
+    rows = ensure_entries_state(LEAVE_ENTRIES_STATE, leave_entries_from_df(default_df))
+    member_options = member_options_from_df(team_df)
+
+    header_cols = st.columns([1.35, 1, 1, 0.42])
+    header_cols[0].markdown("**Member**")
+    header_cols[1].markdown("**Start Date**")
+    header_cols[2].markdown("**End Date**")
+    header_cols[3].markdown("**Action**")
+
+    updated_rows: List[dict] = []
+    remove_row_id: Optional[str] = None
+    for row in rows:
+        row_id = row["id"]
+        cols = st.columns([1.35, 1, 1, 0.42])
+        name_options = selectbox_options_for_value(member_options, row.get("name", ""))
+        current_name = normalize_text_input(row.get("name", ""))
+        selected_name = cols[0].selectbox(
+            "Member",
+            options=name_options,
+            index=name_options.index(current_name) if current_name in name_options else 0,
+            key=f"leave_name_{row_id}",
+            label_visibility="collapsed",
+        )
+        selected_start = cols[1].date_input(
+            "Leave start date",
+            value=row.get("leave_start_date", window_start),
+            min_value=window_start,
+            max_value=window_end,
+            key=f"leave_start_{row_id}",
+            label_visibility="collapsed",
+            width="stretch",
+        )
+        current_end = row.get("leave_end_date") or selected_start
+        selected_end = cols[2].date_input(
+            "Leave end date",
+            value=max(current_end, selected_start),
+            min_value=selected_start,
+            max_value=window_end,
+            key=f"leave_end_{row_id}",
+            label_visibility="collapsed",
+            width="stretch",
+        )
+        if cols[3].button("Delete", key=f"leave_delete_{row_id}", width="stretch"):
+            remove_row_id = row_id
+        updated_rows.append(
+            {
+                "id": row_id,
+                "name": selected_name,
+                "leave_start_date": selected_start,
+                "leave_end_date": selected_end,
+            }
+        )
+
+    if remove_row_id is not None:
+        st.session_state[LEAVE_ENTRIES_STATE] = [row for row in updated_rows if row["id"] != remove_row_id]
+        st.rerun()
+
+    st.session_state[LEAVE_ENTRIES_STATE] = updated_rows
+    if not updated_rows:
+        st.caption("No leave entries added yet.")
+
+    st.markdown("**Add Leave Entry**")
+    add_cols = st.columns([1.35, 1, 1, 0.42])
+    add_name = add_cols[0].selectbox(
+        "Member",
+        options=[""] + member_options,
+        key="leave_add_name",
+        label_visibility="collapsed",
+    )
+    add_start = add_cols[1].date_input(
+        "Leave start date",
+        value=window_start,
+        min_value=window_start,
+        max_value=window_end,
+        key="leave_add_start",
+        label_visibility="collapsed",
+        width="stretch",
+    )
+    add_end = add_cols[2].date_input(
+        "Leave end date",
+        value=add_start,
+        min_value=add_start,
+        max_value=window_end,
+        key="leave_add_end",
+        label_visibility="collapsed",
+        width="stretch",
+    )
+    if add_cols[3].button("Add", key="leave_add_button", width="stretch"):
+        if not add_name:
+            st.warning("Select a member before adding a leave entry.")
+        else:
+            st.session_state[LEAVE_ENTRIES_STATE] = updated_rows + [
+                {
+                    "id": make_entry_id(),
+                    "name": add_name,
+                    "leave_start_date": add_start,
+                    "leave_end_date": add_end,
+                }
+            ]
+            st.rerun()
+
+    return leave_entries_to_df(st.session_state.get(LEAVE_ENTRIES_STATE, updated_rows))
+
+
+def render_bank_holiday_entries_editor(default_df: pd.DataFrame, window_start: date, window_end: date) -> pd.DataFrame:
+    rows = ensure_entries_state(BANK_HOLIDAY_ENTRIES_STATE, bank_holiday_entries_from_df(default_df))
+
+    header_cols = st.columns([1, 0.42])
+    header_cols[0].markdown("**Bank Holiday Date**")
+    header_cols[1].markdown("**Action**")
+
+    updated_rows: List[dict] = []
+    remove_row_id: Optional[str] = None
+    for row in rows:
+        row_id = row["id"]
+        cols = st.columns([1, 0.42])
+        selected_date = cols[0].date_input(
+            "Bank holiday date",
+            value=row.get("bank_holiday_date", window_start),
+            min_value=window_start,
+            max_value=window_end,
+            key=f"bank_holiday_date_{row_id}",
+            label_visibility="collapsed",
+            width="stretch",
+        )
+        if cols[1].button("Delete", key=f"bank_holiday_delete_{row_id}", width="stretch"):
+            remove_row_id = row_id
+        updated_rows.append({"id": row_id, "bank_holiday_date": selected_date})
+
+    if remove_row_id is not None:
+        st.session_state[BANK_HOLIDAY_ENTRIES_STATE] = [row for row in updated_rows if row["id"] != remove_row_id]
+        st.rerun()
+
+    st.session_state[BANK_HOLIDAY_ENTRIES_STATE] = updated_rows
+    if not updated_rows:
+        st.caption("No bank holiday dates added yet.")
+
+    add_cols = st.columns([1, 0.42])
+    add_date = add_cols[0].date_input(
+        "Add bank holiday date",
+        value=window_start,
+        min_value=window_start,
+        max_value=window_end,
+        key="bank_holiday_add_date",
+        label_visibility="collapsed",
+        width="stretch",
+    )
+    if add_cols[1].button("Add", key="bank_holiday_add_button", width="stretch"):
+        st.session_state[BANK_HOLIDAY_ENTRIES_STATE] = updated_rows + [
+            {"id": make_entry_id(), "bank_holiday_date": add_date}
+        ]
+        st.rerun()
+
+    return bank_holiday_entries_to_df(st.session_state.get(BANK_HOLIDAY_ENTRIES_STATE, updated_rows))
+
+
+def render_sync_group_entries_editor(team_df: pd.DataFrame, default_df: pd.DataFrame) -> pd.DataFrame:
+    rows = ensure_entries_state(SYNC_GROUP_ENTRIES_STATE, sync_group_entries_from_df(default_df))
+    member_options = member_options_from_df(team_df)
+
+    header_cols = st.columns([1.1, 1.9, 0.42])
+    header_cols[0].markdown("**Primary Member**")
+    header_cols[1].markdown("**Follower Members**")
+    header_cols[2].markdown("**Action**")
+
+    updated_rows: List[dict] = []
+    remove_row_id: Optional[str] = None
+    for row in rows:
+        row_id = row["id"]
+        cols = st.columns([1.1, 1.9, 0.42])
+        current_primary = normalize_text_input(row.get("primary", ""))
+        primary_options = selectbox_options_for_value(member_options, current_primary)
+        selected_primary = cols[0].selectbox(
+            "Primary member",
+            options=primary_options,
+            index=primary_options.index(current_primary) if current_primary in primary_options else 0,
+            key=f"sync_group_primary_{row_id}",
+            label_visibility="collapsed",
+        )
+
+        current_followers = dedupe_member_names(row.get("followers", []), exclude=selected_primary)
+        follower_options = [name for name in member_options if name != selected_primary]
+        for follower in current_followers:
+            if follower not in follower_options:
+                follower_options.append(follower)
+        selected_followers = cols[1].multiselect(
+            "Follower members",
+            options=follower_options,
+            default=current_followers,
+            key=f"sync_group_followers_{row_id}",
+            label_visibility="collapsed",
+            placeholder="Select follower members",
+        )
+        if cols[2].button("Delete", key=f"sync_group_delete_{row_id}", width="stretch"):
+            remove_row_id = row_id
+        updated_rows.append(
+            {
+                "id": row_id,
+                "primary": selected_primary,
+                "followers": dedupe_member_names(selected_followers, exclude=selected_primary),
+            }
+        )
+
+    if remove_row_id is not None:
+        st.session_state[SYNC_GROUP_ENTRIES_STATE] = [row for row in updated_rows if row["id"] != remove_row_id]
+        st.rerun()
+
+    st.session_state[SYNC_GROUP_ENTRIES_STATE] = updated_rows
+    if not updated_rows:
+        st.caption("No sync groups added yet.")
+
+    st.markdown("**Add Sync Group**")
+    add_cols = st.columns([1.1, 1.9, 0.42])
+    add_primary = add_cols[0].selectbox(
+        "Primary member",
+        options=[""] + member_options,
+        key="sync_group_add_primary",
+        label_visibility="collapsed",
+    )
+    add_follower_options = [name for name in member_options if name != add_primary]
+    add_followers = add_cols[1].multiselect(
+        "Follower members",
+        options=add_follower_options,
+        key="sync_group_add_followers",
+        label_visibility="collapsed",
+        placeholder="Select follower members",
+    )
+    if add_cols[2].button("Add", key="sync_group_add_button", width="stretch"):
+        if not add_primary:
+            st.warning("Select a primary member before adding a sync group.")
+        elif not add_followers:
+            st.warning("Select at least one follower member before adding a sync group.")
+        else:
+            st.session_state[SYNC_GROUP_ENTRIES_STATE] = updated_rows + [
+                {
+                    "id": make_entry_id(),
+                    "primary": add_primary,
+                    "followers": dedupe_member_names(add_followers, exclude=add_primary),
+                }
+            ]
+            st.rerun()
+
+    return sync_group_entries_to_df(st.session_state.get(SYNC_GROUP_ENTRIES_STATE, updated_rows))
+
+
+def render_preassigned_entries_editor(team_df: pd.DataFrame, default_df: pd.DataFrame, window_start: date, window_end: date) -> pd.DataFrame:
+    rows = ensure_entries_state(PREASSIGNED_ENTRIES_STATE, preassigned_entries_from_df(default_df))
+    member_options = member_options_from_df(team_df)
+    fixed_shift_options = [SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT, SHIFT_WEEKOFF, SHIFT_LEAVE]
+
+    header_cols = st.columns([1.2, 1, 1, 0.7, 1, 0.42])
+    header_cols[0].markdown("**Member**")
+    header_cols[1].markdown("**Shift**")
+    header_cols[2].markdown("**Start Date**")
+    header_cols[3].markdown("**Range**")
+    header_cols[4].markdown("**End Date**")
+    header_cols[5].markdown("**Action**")
+
+    updated_rows: List[dict] = []
+    remove_row_id: Optional[str] = None
+    for row in rows:
+        row_id = row["id"]
+        cols = st.columns([1.2, 1, 1, 0.7, 1, 0.42])
+        name_options = selectbox_options_for_value(member_options, row.get("name", ""))
+        current_name = normalize_text_input(row.get("name", ""))
+        current_shift = normalize_text_input(row.get("fixed_shift", SHIFT_MORNING)) or SHIFT_MORNING
+        selected_name = cols[0].selectbox(
+            "Member",
+            options=name_options,
+            index=name_options.index(current_name) if current_name in name_options else 0,
+            key=f"preassigned_name_{row_id}",
+            label_visibility="collapsed",
+        )
+        selected_shift = cols[1].selectbox(
+            "Fixed shift",
+            options=fixed_shift_options,
+            index=fixed_shift_options.index(current_shift) if current_shift in fixed_shift_options else 0,
+            key=f"preassigned_shift_{row_id}",
+            label_visibility="collapsed",
+        )
+        selected_start = cols[2].date_input(
+            "Start date",
+            value=row.get("start_date", window_start),
+            min_value=window_start,
+            max_value=window_end,
+            key=f"preassigned_start_{row_id}",
+            label_visibility="collapsed",
+            width="stretch",
+        )
+        has_end_date = cols[3].checkbox(
+            "Use end date",
+            value=row.get("end_date") is not None,
+            key=f"preassigned_has_end_{row_id}",
+            label_visibility="collapsed",
+        )
+        if has_end_date:
+            current_end = row.get("end_date") or selected_start
+            selected_end = cols[4].date_input(
+                "End date",
+                value=max(current_end, selected_start),
+                min_value=selected_start,
+                max_value=window_end,
+                key=f"preassigned_end_{row_id}",
+                label_visibility="collapsed",
+                width="stretch",
+            )
+        else:
+            selected_end = None
+            cols[4].caption("Single day")
+        if cols[5].button("Delete", key=f"preassigned_delete_{row_id}", width="stretch"):
+            remove_row_id = row_id
+        updated_rows.append(
+            {
+                "id": row_id,
+                "name": selected_name,
+                "start_date": selected_start,
+                "end_date": selected_end,
+                "fixed_shift": selected_shift,
+            }
+        )
+
+    if remove_row_id is not None:
+        st.session_state[PREASSIGNED_ENTRIES_STATE] = [row for row in updated_rows if row["id"] != remove_row_id]
+        st.rerun()
+
+    st.session_state[PREASSIGNED_ENTRIES_STATE] = updated_rows
+    if not updated_rows:
+        st.caption("No preassigned shifts added yet.")
+
+    st.markdown("**Add Preassigned Shift**")
+    add_cols = st.columns([1.2, 1, 1, 0.7, 1, 0.42])
+    add_name = add_cols[0].selectbox(
+        "Member",
+        options=[""] + member_options,
+        key="preassigned_add_name",
+        label_visibility="collapsed",
+    )
+    add_shift = add_cols[1].selectbox(
+        "Fixed shift",
+        options=fixed_shift_options,
+        key="preassigned_add_shift",
+        label_visibility="collapsed",
+    )
+    add_start = add_cols[2].date_input(
+        "Start date",
+        value=window_start,
+        min_value=window_start,
+        max_value=window_end,
+        key="preassigned_add_start",
+        label_visibility="collapsed",
+        width="stretch",
+    )
+    add_has_end = add_cols[3].checkbox(
+        "Use end date",
+        value=False,
+        key="preassigned_add_has_end",
+        label_visibility="collapsed",
+    )
+    if add_has_end:
+        add_end = add_cols[4].date_input(
+            "End date",
+            value=add_start,
+            min_value=add_start,
+            max_value=window_end,
+            key="preassigned_add_end",
+            label_visibility="collapsed",
+            width="stretch",
+        )
+    else:
+        add_end = None
+        add_cols[4].caption("Single day")
+    if add_cols[5].button("Add", key="preassigned_add_button", width="stretch"):
+        if not add_name:
+            st.warning("Select a member before adding a preassigned shift.")
+        else:
+            st.session_state[PREASSIGNED_ENTRIES_STATE] = updated_rows + [
+                {
+                    "id": make_entry_id(),
+                    "name": add_name,
+                    "start_date": add_start,
+                    "end_date": add_end,
+                    "fixed_shift": add_shift,
+                }
+            ]
+            st.rerun()
+
+    return preassigned_entries_to_df(st.session_state.get(PREASSIGNED_ENTRIES_STATE, updated_rows))
 
 
 def sample_team_df() -> pd.DataFrame:
@@ -3786,7 +4367,28 @@ if can_manage:
     with row1:
         if st.button("Save Team Details", width="stretch"):
             try:
-                save_inputs(team_df, leaves_default_df, bank_holidays_default_df, sync_groups_default_df, preassigned_default_df)
+                current_leaves_df = leave_entries_to_df(
+                    st.session_state.get(LEAVE_ENTRIES_STATE, leave_entries_from_df(leaves_default_df))
+                )
+                current_bank_holidays_df = bank_holiday_entries_to_df(
+                    st.session_state.get(
+                        BANK_HOLIDAY_ENTRIES_STATE,
+                        bank_holiday_entries_from_df(bank_holidays_default_df),
+                    )
+                )
+                current_sync_groups_df = sync_group_entries_to_df(
+                    st.session_state.get(
+                        SYNC_GROUP_ENTRIES_STATE,
+                        sync_group_entries_from_df(sync_groups_default_df),
+                    )
+                )
+                current_preassigned_df = preassigned_entries_to_df(
+                    st.session_state.get(
+                        PREASSIGNED_ENTRIES_STATE,
+                        preassigned_entries_from_df(preassigned_default_df),
+                    )
+                )
+                save_inputs(team_df, current_leaves_df, current_bank_holidays_df, current_sync_groups_df, current_preassigned_df)
                 st.session_state["team_import_df"] = team_df.copy()
                 log_activity("Inputs", "Save Team Details", f"Saved {len(team_df)} team member rows.")
                 st.success("Team details saved to the database.")
@@ -3810,6 +4412,21 @@ if can_manage:
                 BH_EDITOR_KEY,
                 SYNC_GROUPS_EDITOR_KEY,
                 PREASSIGNED_EDITOR_KEY,
+                LEAVE_ENTRIES_STATE,
+                BANK_HOLIDAY_ENTRIES_STATE,
+                SYNC_GROUP_ENTRIES_STATE,
+                PREASSIGNED_ENTRIES_STATE,
+                "leave_add_name",
+                "leave_add_start",
+                "leave_add_end",
+                "bank_holiday_add_date",
+                "sync_group_add_primary",
+                "sync_group_add_followers",
+                "preassigned_add_name",
+                "preassigned_add_shift",
+                "preassigned_add_start",
+                "preassigned_add_has_end",
+                "preassigned_add_end",
                 "schedule_setup_start_date",
                 "schedule_setup_end_date",
                 "schedule_setup_weekoffs",
@@ -3824,19 +4441,8 @@ if can_manage:
             st.rerun()
 
     render_section_header("02", "Leaves", "Capture leave ranges so rota generation respects planned absences.")
-    st.caption("Enter dates in YYYY-MM-DD format.")
-    leaves_editor_df = prepare_date_editor_df(leaves_default_df, ["leave_start_date", "leave_end_date"])
-    leaves_df = st.data_editor(
-        leaves_editor_df,
-        num_rows="dynamic",
-        width="stretch",
-        column_config={
-            "name": st.column_config.TextColumn("Name"),
-            "leave_start_date": st.column_config.TextColumn("Leave start date", validate=DATE_INPUT_REGEX),
-            "leave_end_date": st.column_config.TextColumn("Leave end date", validate=DATE_INPUT_REGEX),
-        },
-        key=LEAVE_EDITOR_KEY,
-    )
+    st.caption("Choose the member from the dropdown and pick leave dates from the calendar.")
+    leaves_df = render_leave_entries_editor(team_df, leaves_default_df, start_date, end_date)
 
     render_section_header("03", "Bank Holidays", "Choose how bank holidays are added so restricted staffing rules apply automatically.")
     bh_mode = st.radio(
@@ -3857,26 +4463,16 @@ if can_manage:
             key="schedule_setup_auto_bh_days",
         )
 
-    specific_bh_df = prepare_date_editor_df(bank_holidays_default_df, ["bank_holiday_date"])
+    specific_bh_df = bank_holiday_entries_to_df(
+        ensure_entries_state(BANK_HOLIDAY_ENTRIES_STATE, bank_holiday_entries_from_df(bank_holidays_default_df))
+    )
     if bh_mode in {"By specific dates", "Both"}:
-        st.caption("Enter bank holiday dates in YYYY-MM-DD format.")
-        specific_bh_df = st.data_editor(
-            specific_bh_df,
-            num_rows="dynamic",
-            width="stretch",
-            column_config={"bank_holiday_date": st.column_config.TextColumn("Bank holiday date", validate=DATE_INPUT_REGEX)},
-            key=BH_EDITOR_KEY,
-        )
+        st.caption("Pick bank holiday dates directly from the calendar.")
+        specific_bh_df = render_bank_holiday_entries_editor(bank_holidays_default_df, start_date, end_date)
 
     render_section_header("04", "Shift Sync Groups", "Define primary-led sync groups so linked members follow the same shift whenever possible.")
-    st.caption("Enter comma-separated member names in order. The first member is treated as the primary shift member, and the remaining members will follow the same shift whenever possible. Example: Aarav, Bhavna, Divya")
-    sync_groups_df = st.data_editor(
-        sync_groups_default_df,
-        num_rows="dynamic",
-        width="stretch",
-        column_config={"sync_group": st.column_config.TextColumn("Sync group (primary first)")},
-        key=SYNC_GROUPS_EDITOR_KEY,
-    )
+    st.caption("Choose the primary member and follower members from the dropdowns to build each sync group.")
+    sync_groups_df = render_sync_group_entries_editor(team_df, sync_groups_default_df)
 
     render_section_header(
         "05",
@@ -3888,21 +4484,8 @@ if can_manage:
         "Set only the start date for a single-day lock, or add an end date to cover a range. "
         "If you preassign Night dates for a member in a month, the app treats them as one continuous Night block and keeps the compulsory WOs after that block."
     )
-    preassigned_df = st.data_editor(
-        prepare_date_editor_df(preassigned_default_df, ["start_date", "end_date"]),
-        num_rows="dynamic",
-        width="stretch",
-        column_config={
-            "name": st.column_config.TextColumn("Name"),
-            "start_date": st.column_config.TextColumn("Start date", validate=DATE_INPUT_REGEX),
-            "end_date": st.column_config.TextColumn("End date (optional)", validate=DATE_INPUT_REGEX),
-            "fixed_shift": st.column_config.SelectboxColumn(
-                "Fixed shift",
-                options=[SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT, SHIFT_WEEKOFF, SHIFT_LEAVE],
-            ),
-        },
-        key=PREASSIGNED_EDITOR_KEY,
-    )
+    st.caption("Choose the member and shift from the dropdowns, then use the calendar for the start and optional end date.")
+    preassigned_df = render_preassigned_entries_editor(team_df, preassigned_default_df, start_date, end_date)
     autosave_workspace_state(
         team_df=team_df,
         leaves_df=leaves_df,
