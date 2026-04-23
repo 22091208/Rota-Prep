@@ -32,6 +32,7 @@ LEAVE_EDITOR_KEY = "leave_editor_v2"
 BH_EDITOR_KEY = "bh_editor_v2"
 SYNC_GROUPS_EDITOR_KEY = "sync_groups_editor_v2"
 PREASSIGNED_EDITOR_KEY = "preassigned_shifts_editor_v2"
+DATE_INPUT_REGEX = r"^$|^\d{4}-\d{2}-\d{2}$"
 
 SHIFT_MORNING = "Morning"
 SHIFT_AFTERNOON = "Afternoon"
@@ -243,7 +244,9 @@ def ensure_date_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
 def prepare_date_editor_df(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     normalized_df = ensure_date_columns(df, cols)
     for col in cols:
-        normalized_df[col] = normalized_df[col].apply(lambda value: value.date() if not pd.isna(value) else None)
+        normalized_df[col] = normalized_df[col].apply(
+            lambda value: value.date().isoformat() if not pd.isna(value) else ""
+        )
     return normalized_df
 
 
@@ -428,10 +431,13 @@ def serialize_dates_for_json(records: List[dict], date_cols: List[str]) -> List[
         row = dict(row)
         for c in date_cols:
             v = row.get(c)
-            if pd.isna(v) or v in ("", None):
+            if pd.isna(v) or str(v).strip().lower() in {"", "none", "nan", "nat"}:
                 row[c] = None
             else:
-                row[c] = pd.to_datetime(v).date().isoformat()
+                try:
+                    row[c] = pd.to_datetime(v).date().isoformat()
+                except Exception as exc:
+                    raise ValueError(f"Invalid date value '{v}' in column '{c}'. Use YYYY-MM-DD.") from exc
         out.append(row)
     return out
 
@@ -539,13 +545,18 @@ def autosave_workspace_state(
     auto_bank_holiday_days: int,
 ):
     normalized_preassigned_df = normalize_preassigned_shifts_df(preassigned_df)
-    current_inputs_payload = {
-        "team": team_df.fillna("").to_dict(orient="records"),
-        "leaves": serialize_dates_for_json(leaves_df.to_dict(orient="records"), ["leave_start_date", "leave_end_date"]),
-        "bank_holidays": serialize_dates_for_json(bank_df.to_dict(orient="records"), ["bank_holiday_date"]),
-        "sync_groups": sync_df.fillna("").to_dict(orient="records"),
-        "preassigned_shifts": serialize_dates_for_json(normalized_preassigned_df.to_dict(orient="records"), ["start_date", "end_date"]),
-    }
+    try:
+        current_inputs_payload = {
+            "team": team_df.fillna("").to_dict(orient="records"),
+            "leaves": serialize_dates_for_json(leaves_df.to_dict(orient="records"), ["leave_start_date", "leave_end_date"]),
+            "bank_holidays": serialize_dates_for_json(bank_df.to_dict(orient="records"), ["bank_holiday_date"]),
+            "sync_groups": sync_df.fillna("").to_dict(orient="records"),
+            "preassigned_shifts": serialize_dates_for_json(normalized_preassigned_df.to_dict(orient="records"), ["start_date", "end_date"]),
+        }
+        st.session_state["inputs_autosave_error"] = ""
+    except Exception as exc:
+        st.session_state["inputs_autosave_error"] = str(exc)
+        return
     saved_inputs_payload = load_state(STATE_KEY_INPUTS)
     if saved_inputs_payload != current_inputs_payload:
         save_state(STATE_KEY_INPUTS, current_inputs_payload)
@@ -3813,6 +3824,7 @@ if can_manage:
             st.rerun()
 
     render_section_header("02", "Leaves", "Capture leave ranges so rota generation respects planned absences.")
+    st.caption("Enter dates in YYYY-MM-DD format.")
     leaves_editor_df = prepare_date_editor_df(leaves_default_df, ["leave_start_date", "leave_end_date"])
     leaves_df = st.data_editor(
         leaves_editor_df,
@@ -3820,8 +3832,8 @@ if can_manage:
         width="stretch",
         column_config={
             "name": st.column_config.TextColumn("Name"),
-            "leave_start_date": st.column_config.DateColumn("Leave start date"),
-            "leave_end_date": st.column_config.DateColumn("Leave end date"),
+            "leave_start_date": st.column_config.TextColumn("Leave start date", validate=DATE_INPUT_REGEX),
+            "leave_end_date": st.column_config.TextColumn("Leave end date", validate=DATE_INPUT_REGEX),
         },
         key=LEAVE_EDITOR_KEY,
     )
@@ -3847,11 +3859,12 @@ if can_manage:
 
     specific_bh_df = prepare_date_editor_df(bank_holidays_default_df, ["bank_holiday_date"])
     if bh_mode in {"By specific dates", "Both"}:
+        st.caption("Enter bank holiday dates in YYYY-MM-DD format.")
         specific_bh_df = st.data_editor(
             specific_bh_df,
             num_rows="dynamic",
             width="stretch",
-            column_config={"bank_holiday_date": st.column_config.DateColumn("Bank holiday date")},
+            column_config={"bank_holiday_date": st.column_config.TextColumn("Bank holiday date", validate=DATE_INPUT_REGEX)},
             key=BH_EDITOR_KEY,
         )
 
@@ -3881,8 +3894,8 @@ if can_manage:
         width="stretch",
         column_config={
             "name": st.column_config.TextColumn("Name"),
-            "start_date": st.column_config.DateColumn("Start date"),
-            "end_date": st.column_config.DateColumn("End date (optional)"),
+            "start_date": st.column_config.TextColumn("Start date", validate=DATE_INPUT_REGEX),
+            "end_date": st.column_config.TextColumn("End date (optional)", validate=DATE_INPUT_REGEX),
             "fixed_shift": st.column_config.SelectboxColumn(
                 "Fixed shift",
                 options=[SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT, SHIFT_WEEKOFF, SHIFT_LEAVE],
@@ -3903,6 +3916,9 @@ if can_manage:
         auto_bank_holiday_days=int(auto_bh_days),
     )
     st.caption("Autosave is on. Changes to setup and resource details are stored automatically while you edit.")
+    autosave_error = st.session_state.get("inputs_autosave_error")
+    if autosave_error:
+        st.warning(f"Autosave paused until date fields are valid: {autosave_error}")
 
     col1, col2, col3 = st.columns(3)
     with col1:
