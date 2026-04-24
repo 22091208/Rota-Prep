@@ -37,6 +37,7 @@ PREASSIGNED_EDITOR_KEY = "preassigned_shifts_editor_v2"
 LEAVE_ENTRIES_STATE = "leave_entries_state"
 BANK_HOLIDAY_ENTRIES_STATE = "bank_holiday_entries_state"
 SYNC_GROUP_ENTRIES_STATE = "sync_group_entries_state"
+WEEKOFF_REQUEST_ENTRIES_STATE = "weekoff_request_entries_state"
 PREASSIGNED_ENTRIES_STATE = "preassigned_entries_state"
 
 SHIFT_MORNING = "Morning"
@@ -497,6 +498,145 @@ def preassigned_entries_to_df(rows: List[dict]) -> pd.DataFrame:
     return normalize_preassigned_shifts_df(pd.DataFrame(records, columns=PREASSIGNED_SHIFT_COLUMNS))
 
 
+def filter_preassigned_shifts_df(
+    df: pd.DataFrame,
+    *,
+    include_fixed_shifts: Optional[Set[str]] = None,
+    exclude_fixed_shifts: Optional[Set[str]] = None,
+) -> pd.DataFrame:
+    normalized_df = normalize_preassigned_shifts_df(df)
+    include_set = {normalize_text_input(shift).lower() for shift in (include_fixed_shifts or set()) if normalize_text_input(shift)}
+    exclude_set = {normalize_text_input(shift).lower() for shift in (exclude_fixed_shifts or set()) if normalize_text_input(shift)}
+
+    mask = pd.Series([True] * len(normalized_df), index=normalized_df.index)
+    lowered_shifts = normalized_df["fixed_shift"].fillna("").astype(str).str.strip().str.lower()
+    if include_set:
+        mask &= lowered_shifts.isin(include_set)
+    if exclude_set:
+        mask &= ~lowered_shifts.isin(exclude_set)
+    return normalized_df.loc[mask, PREASSIGNED_SHIFT_COLUMNS].reset_index(drop=True)
+
+
+def weekoff_request_entries_from_df(df: pd.DataFrame) -> List[dict]:
+    return preassigned_entries_from_df(
+        filter_preassigned_shifts_df(df, include_fixed_shifts={SHIFT_WEEKOFF})
+    )
+
+
+def weekoff_request_entries_to_df(rows: List[dict]) -> pd.DataFrame:
+    records = [
+        {
+            "name": normalize_text_input(row.get("name", "")),
+            "start_date": row.get("start_date"),
+            "end_date": row.get("end_date"),
+            "fixed_shift": SHIFT_WEEKOFF,
+        }
+        for row in rows
+        if normalize_text_input(row.get("name", "")) and row.get("start_date")
+    ]
+    return normalize_preassigned_shifts_df(pd.DataFrame(records, columns=PREASSIGNED_SHIFT_COLUMNS))
+
+
+def combine_preassigned_input_dfs(*dfs: pd.DataFrame) -> pd.DataFrame:
+    records: List[dict] = []
+    seen: Set[Tuple[str, Optional[date], Optional[date], str]] = set()
+
+    for df in dfs:
+        if df is None:
+            continue
+        normalized_df = normalize_preassigned_shifts_df(df)
+        for _, row in normalized_df.iterrows():
+            name = normalize_text_input(row.get("name", ""))
+            start_dt = coerce_optional_date(row.get("start_date"))
+            end_dt = coerce_optional_date(row.get("end_date"))
+            fixed_shift = normalize_text_input(row.get("fixed_shift", ""))
+            if not name or start_dt is None or not fixed_shift:
+                continue
+            dedupe_key = (name.lower(), start_dt, end_dt, fixed_shift.lower())
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            records.append(
+                {
+                    "name": name,
+                    "start_date": start_dt,
+                    "end_date": end_dt,
+                    "fixed_shift": fixed_shift,
+                }
+            )
+
+    return normalize_preassigned_shifts_df(pd.DataFrame(records, columns=PREASSIGNED_SHIFT_COLUMNS))
+
+
+def current_combined_preassigned_df(weekoff_default_df: pd.DataFrame, preassigned_default_df: pd.DataFrame) -> pd.DataFrame:
+    current_weekoff_df = weekoff_request_entries_to_df(
+        st.session_state.get(
+            WEEKOFF_REQUEST_ENTRIES_STATE,
+            weekoff_request_entries_from_df(weekoff_default_df),
+        )
+    )
+    current_preassigned_df = preassigned_entries_to_df(
+        st.session_state.get(
+            PREASSIGNED_ENTRIES_STATE,
+            preassigned_entries_from_df(preassigned_default_df),
+        )
+    )
+    return combine_preassigned_input_dfs(current_weekoff_df, current_preassigned_df)
+
+
+def migrate_weekoff_entries_from_preassigned_state(weekoff_default_df: pd.DataFrame, preassigned_default_df: pd.DataFrame):
+    weekoff_rows = ensure_entries_state(
+        WEEKOFF_REQUEST_ENTRIES_STATE,
+        weekoff_request_entries_from_df(weekoff_default_df),
+    )
+    preassigned_rows = ensure_entries_state(
+        PREASSIGNED_ENTRIES_STATE,
+        preassigned_entries_from_df(preassigned_default_df),
+    )
+
+    existing_weekoff_keys = {
+        (
+            normalize_text_input(row.get("name", "")).lower(),
+            coerce_optional_date(row.get("start_date")),
+            coerce_optional_date(row.get("end_date")),
+        )
+        for row in weekoff_rows
+        if normalize_text_input(row.get("name", "")) and coerce_optional_date(row.get("start_date")) is not None
+    }
+
+    migrated_rows = list(weekoff_rows)
+    cleaned_preassigned_rows: List[dict] = []
+    did_migrate = False
+
+    for row in preassigned_rows:
+        fixed_shift = normalize_text_input(row.get("fixed_shift", ""))
+        if fixed_shift.lower() != SHIFT_WEEKOFF.lower():
+            cleaned_preassigned_rows.append(row)
+            continue
+
+        row_key = (
+            normalize_text_input(row.get("name", "")).lower(),
+            coerce_optional_date(row.get("start_date")),
+            coerce_optional_date(row.get("end_date")),
+        )
+        if row_key not in existing_weekoff_keys:
+            migrated_rows.append(
+                {
+                    "id": row.get("id", make_entry_id()),
+                    "name": normalize_text_input(row.get("name", "")),
+                    "start_date": coerce_optional_date(row.get("start_date")),
+                    "end_date": coerce_optional_date(row.get("end_date")),
+                    "fixed_shift": SHIFT_WEEKOFF,
+                }
+            )
+            existing_weekoff_keys.add(row_key)
+        did_migrate = True
+
+    if did_migrate:
+        st.session_state[WEEKOFF_REQUEST_ENTRIES_STATE] = migrated_rows
+        st.session_state[PREASSIGNED_ENTRIES_STATE] = cleaned_preassigned_rows
+
+
 def selectbox_options_for_value(options: List[str], current_value: str) -> List[str]:
     cleaned_value = normalize_text_input(current_value)
     resolved_options = [""] + options
@@ -824,12 +964,158 @@ def render_sync_group_entries_editor(team_df: pd.DataFrame, default_df: pd.DataF
     return sync_group_entries_to_df(st.session_state.get(SYNC_GROUP_ENTRIES_STATE, updated_rows))
 
 
+def render_weekoff_request_entries_editor(team_df: pd.DataFrame, default_df: pd.DataFrame, window_start: date, window_end: date) -> pd.DataFrame:
+    rows = ensure_entries_state(WEEKOFF_REQUEST_ENTRIES_STATE, weekoff_request_entries_from_df(default_df))
+    rows, clipped_count, removed_count = sanitize_preassigned_rows_for_window(rows, window_start, window_end)
+    st.session_state[WEEKOFF_REQUEST_ENTRIES_STATE] = rows
+    member_options = member_options_from_df(team_df)
+
+    if clipped_count or removed_count:
+        note_parts = []
+        if clipped_count:
+            note_parts.append(f"{clipped_count} Week Off request entr{'y' if clipped_count == 1 else 'ies'} clipped to the selected month")
+        if removed_count:
+            note_parts.append(f"{removed_count} Week Off request entr{'y' if removed_count == 1 else 'ies'} from another month removed from the current workspace")
+        st.caption(". ".join(note_parts) + ".")
+
+    header_cols = st.columns([1.35, 1, 0.7, 1, 0.42])
+    header_cols[0].markdown("**Member**")
+    header_cols[1].markdown("**Start Date**")
+    header_cols[2].markdown("**Range**")
+    header_cols[3].markdown("**End Date**")
+    header_cols[4].markdown("**Action**")
+
+    updated_rows: List[dict] = []
+    remove_row_id: Optional[str] = None
+    for row in rows:
+        row_id = row["id"]
+        cols = st.columns([1.35, 1, 0.7, 1, 0.42])
+        name_options = selectbox_options_for_value(member_options, row.get("name", ""))
+        current_name = normalize_text_input(row.get("name", ""))
+        start_key = f"weekoff_start_{row_id}"
+        end_key = f"weekoff_end_{row_id}"
+        row_start = clamp_date_to_window(row.get("start_date"), window_start, window_end, window_start)
+        sync_date_input_session_state(start_key, window_start, window_end, row_start)
+        selected_name = cols[0].selectbox(
+            "Member",
+            options=name_options,
+            index=name_options.index(current_name) if current_name in name_options else 0,
+            key=f"weekoff_name_{row_id}",
+            label_visibility="collapsed",
+        )
+        selected_start = cols[1].date_input(
+            "Week Off start date",
+            value=st.session_state.get(start_key, row_start),
+            min_value=window_start,
+            max_value=window_end,
+            key=start_key,
+            label_visibility="collapsed",
+            width="stretch",
+        )
+        has_end_date = cols[2].checkbox(
+            "Use end date",
+            value=row.get("end_date") is not None,
+            key=f"weekoff_has_end_{row_id}",
+            label_visibility="collapsed",
+        )
+        if has_end_date:
+            current_end = clamp_date_to_window(row.get("end_date") or selected_start, selected_start, window_end, selected_start)
+            sync_date_input_session_state(end_key, selected_start, window_end, current_end)
+            selected_end = cols[3].date_input(
+                "Week Off end date",
+                value=st.session_state.get(end_key, current_end),
+                min_value=selected_start,
+                max_value=window_end,
+                key=end_key,
+                label_visibility="collapsed",
+                width="stretch",
+            )
+        else:
+            selected_end = None
+            cols[3].caption("Single day")
+
+        if cols[4].button("Delete", key=f"weekoff_delete_{row_id}", width="stretch"):
+            remove_row_id = row_id
+        updated_rows.append(
+            {
+                "id": row_id,
+                "name": selected_name,
+                "start_date": selected_start,
+                "end_date": selected_end,
+                "fixed_shift": SHIFT_WEEKOFF,
+            }
+        )
+
+    if remove_row_id is not None:
+        st.session_state[WEEKOFF_REQUEST_ENTRIES_STATE] = [row for row in updated_rows if row["id"] != remove_row_id]
+        st.rerun()
+
+    st.session_state[WEEKOFF_REQUEST_ENTRIES_STATE] = updated_rows
+    if not updated_rows:
+        st.caption("No locked Week Off dates added yet.")
+
+    st.markdown("**Add Week Off Request**")
+    add_cols = st.columns([1.35, 1, 0.7, 1, 0.42])
+    add_name = add_cols[0].selectbox(
+        "Member",
+        options=[""] + member_options,
+        key="weekoff_add_name",
+        label_visibility="collapsed",
+    )
+    sync_date_input_session_state("weekoff_add_start", window_start, window_end, window_start)
+    add_start = add_cols[1].date_input(
+        "Week Off start date",
+        value=st.session_state.get("weekoff_add_start", window_start),
+        min_value=window_start,
+        max_value=window_end,
+        key="weekoff_add_start",
+        label_visibility="collapsed",
+        width="stretch",
+    )
+    add_has_end = add_cols[2].checkbox(
+        "Use end date",
+        value=False,
+        key="weekoff_add_has_end",
+        label_visibility="collapsed",
+    )
+    if add_has_end:
+        sync_date_input_session_state("weekoff_add_end", add_start, window_end, add_start)
+        add_end = add_cols[3].date_input(
+            "Week Off end date",
+            value=st.session_state.get("weekoff_add_end", add_start),
+            min_value=add_start,
+            max_value=window_end,
+            key="weekoff_add_end",
+            label_visibility="collapsed",
+            width="stretch",
+        )
+    else:
+        add_end = None
+        add_cols[3].caption("Single day")
+    if add_cols[4].button("Add", key="weekoff_add_button", width="stretch"):
+        if not add_name:
+            st.warning("Select a member before adding a Week Off request.")
+        else:
+            st.session_state[WEEKOFF_REQUEST_ENTRIES_STATE] = updated_rows + [
+                {
+                    "id": make_entry_id(),
+                    "name": add_name,
+                    "start_date": add_start,
+                    "end_date": add_end,
+                    "fixed_shift": SHIFT_WEEKOFF,
+                }
+            ]
+            st.rerun()
+
+    return weekoff_request_entries_to_df(st.session_state.get(WEEKOFF_REQUEST_ENTRIES_STATE, updated_rows))
+
+
 def render_preassigned_entries_editor(team_df: pd.DataFrame, default_df: pd.DataFrame, window_start: date, window_end: date) -> pd.DataFrame:
     rows = ensure_entries_state(PREASSIGNED_ENTRIES_STATE, preassigned_entries_from_df(default_df))
     rows, clipped_count, removed_count = sanitize_preassigned_rows_for_window(rows, window_start, window_end)
     st.session_state[PREASSIGNED_ENTRIES_STATE] = rows
     member_options = member_options_from_df(team_df)
-    fixed_shift_options = [SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT, SHIFT_WEEKOFF, SHIFT_LEAVE]
+    fixed_shift_options = [SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT, SHIFT_LEAVE]
 
     if clipped_count or removed_count:
         note_parts = []
@@ -5975,14 +6261,23 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-team_default_df, leaves_default_df, bank_holidays_default_df, sync_groups_default_df, preassigned_default_df = load_inputs()
+team_default_df, leaves_default_df, bank_holidays_default_df, sync_groups_default_df, all_preassigned_default_df = load_inputs()
 schedule_setup_defaults = load_schedule_setup()
 saved_rota = load_saved_rota()
 
 leaves_default_df = ensure_date_columns(leaves_default_df, ["leave_start_date", "leave_end_date"])
 bank_holidays_default_df = ensure_date_columns(bank_holidays_default_df, ["bank_holiday_date"])
-preassigned_default_df = normalize_preassigned_shifts_df(preassigned_default_df)
-preassigned_df = preassigned_default_df.copy()
+all_preassigned_default_df = normalize_preassigned_shifts_df(all_preassigned_default_df)
+weekoff_request_default_df = filter_preassigned_shifts_df(
+    all_preassigned_default_df,
+    include_fixed_shifts={SHIFT_WEEKOFF},
+)
+preassigned_default_df = filter_preassigned_shifts_df(
+    all_preassigned_default_df,
+    exclude_fixed_shifts={SHIFT_WEEKOFF},
+)
+combined_preassigned_df = combine_preassigned_input_dfs(weekoff_request_default_df, preassigned_default_df)
+migrate_weekoff_entries_from_preassigned_state(weekoff_request_default_df, preassigned_default_df)
 
 with st.sidebar:
     can_manage = st.session_state.get("auth_role") in {"admin", "dev"}
@@ -6185,7 +6480,19 @@ if can_manage:
                         preassigned_entries_from_df(preassigned_default_df),
                     )
                 )
-                save_inputs(team_df, current_leaves_df, current_bank_holidays_df, current_sync_groups_df, current_preassigned_df)
+                current_weekoff_df = weekoff_request_entries_to_df(
+                    st.session_state.get(
+                        WEEKOFF_REQUEST_ENTRIES_STATE,
+                        weekoff_request_entries_from_df(weekoff_request_default_df),
+                    )
+                )
+                save_inputs(
+                    team_df,
+                    current_leaves_df,
+                    current_bank_holidays_df,
+                    current_sync_groups_df,
+                    combine_preassigned_input_dfs(current_weekoff_df, current_preassigned_df),
+                )
                 st.session_state["team_import_df"] = team_df.copy()
                 log_activity("Inputs", "Save Team Details", f"Saved {len(team_df)} team member rows.")
                 st.success("Team details saved to the database.")
@@ -6203,6 +6510,7 @@ if can_manage:
                 "leave_editor",
                 "bh_editor",
                 "sync_groups_editor",
+                "weekoff_requests_editor",
                 "preassigned_shifts_editor",
                 TEAM_EDITOR_KEY,
                 LEAVE_EDITOR_KEY,
@@ -6212,6 +6520,7 @@ if can_manage:
                 LEAVE_ENTRIES_STATE,
                 BANK_HOLIDAY_ENTRIES_STATE,
                 SYNC_GROUP_ENTRIES_STATE,
+                WEEKOFF_REQUEST_ENTRIES_STATE,
                 PREASSIGNED_ENTRIES_STATE,
                 "leave_add_name",
                 "leave_add_start",
@@ -6219,6 +6528,10 @@ if can_manage:
                 "bank_holiday_add_date",
                 "sync_group_add_primary",
                 "sync_group_add_followers",
+                "weekoff_add_name",
+                "weekoff_add_start",
+                "weekoff_add_has_end",
+                "weekoff_add_end",
                 "preassigned_add_name",
                 "preassigned_add_shift",
                 "preassigned_add_start",
@@ -6275,6 +6588,18 @@ if can_manage:
 
     render_section_header(
         "05",
+        "Locked Week Off Dates",
+        "Pick exact Week Off dates for selected members. The rota generator will keep these dates locked and rebalance the rest of the month around them.",
+    )
+    st.caption(
+        "Use this when a member must be off on a known date or short date range. "
+        "These dates are treated as fixed Week Offs before the rota is generated, so the remaining shifts are adjusted automatically while the rota rules are still enforced."
+    )
+    st.caption("Choose the member from the dropdown, then pick the Week Off date or optional date range from the calendar.")
+    weekoff_requests_df = render_weekoff_request_entries_editor(team_df, weekoff_request_default_df, start_date, end_date)
+
+    render_section_header(
+        "06",
         "Preassigned Shifts",
         "Lock specific shifts before generation. The scheduler will fill the remaining rota around these fixed assignments while still applying the rota rules.",
     )
@@ -6285,12 +6610,13 @@ if can_manage:
     )
     st.caption("Choose the member and shift from the dropdowns, then use the calendar for the start and optional end date.")
     preassigned_df = render_preassigned_entries_editor(team_df, preassigned_default_df, start_date, end_date)
+    combined_preassigned_df = combine_preassigned_input_dfs(weekoff_requests_df, preassigned_df)
     autosave_workspace_state(
         team_df=team_df,
         leaves_df=leaves_df,
         bank_df=specific_bh_df,
         sync_df=sync_groups_df,
-        preassigned_df=preassigned_df,
+        preassigned_df=combined_preassigned_df,
         start_date=start_date,
         end_date=end_date,
         weekoffs_per_month=int(weekoffs_per_month),
@@ -6318,7 +6644,7 @@ if can_manage:
 
     if save_all:
         try:
-            save_inputs(team_df, leaves_df, specific_bh_df, sync_groups_df, preassigned_df)
+            save_inputs(team_df, leaves_df, specific_bh_df, sync_groups_df, combined_preassigned_df)
             st.session_state["team_import_df"] = team_df.copy()
             log_activity("Inputs", "Save All Inputs", f"Saved inputs for {start_date.isoformat()} to {end_date.isoformat()}.")
             st.success("Inputs saved to the database.")
@@ -6337,7 +6663,7 @@ if can_manage:
             sync_groups = parse_sync_groups(sync_groups_df, valid_names)
             bank_holidays = resolve_selected_bank_holidays(start_date, end_date, bh_mode, int(auto_bh_days), specific_bh_df)
             preassigned_shifts = parse_preassigned_shifts(
-                preassigned_df,
+                combined_preassigned_df,
                 members,
                 start_date,
                 end_date,
@@ -6345,7 +6671,7 @@ if can_manage:
                 bank_holidays,
             )
 
-            save_inputs(team_df, leaves_df, specific_bh_df, sync_groups_df, preassigned_df)
+            save_inputs(team_df, leaves_df, specific_bh_df, sync_groups_df, combined_preassigned_df)
 
             matrix_df, full_df, daywise_df, summary_df, warnings_df = generate_rota(
                 members=members,
@@ -6629,7 +6955,7 @@ if rota_bundle is not None:
                 team_df=team_df,
                 leaves_df=leaves_df,
                 sync_groups_df=sync_groups_df,
-                preassigned_shifts_df=preassigned_df,
+                preassigned_shifts_df=combined_preassigned_df,
                 start_date=start_date,
                 end_date=end_date,
                 weekoffs_per_month=int(weekoffs_per_month),
@@ -6663,7 +6989,7 @@ else:
             team_df=team_df,
             leaves_df=leaves_df,
             sync_groups_df=sync_groups_df,
-            preassigned_shifts_df=preassigned_df,
+            preassigned_shifts_df=combined_preassigned_df,
             start_date=start_date,
             end_date=end_date,
             weekoffs_per_month=int(weekoffs_per_month),
