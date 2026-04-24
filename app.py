@@ -5,6 +5,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from functools import lru_cache
 from html import escape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -136,7 +137,8 @@ MIN_AFTERNOON = 2
 MIN_NIGHT = 2
 MAX_MORNING = 3
 MAX_NIGHT = 3
-MAX_CONTINUOUS_NIGHT = 5
+MIN_CONTINUOUS_NIGHT = 4
+MAX_CONTINUOUS_NIGHT = 6
 MANDATORY_OFF_AFTER_NIGHT = 2
 MAX_CONTINUOUS_WORKING_DAYS = 6
 MONTH_OPTIONS = list(calendar.month_name)[1:]
@@ -1508,6 +1510,36 @@ def parse_sync_groups(df: pd.DataFrame, valid_names: Set[str]) -> Dict[str, List
     return primary_to_followers
 
 
+def sync_group_maps(sync_groups: Dict[str, List[str]]) -> Tuple[Dict[str, str], Set[str]]:
+    follower_to_primary = {
+        follower: primary
+        for primary, followers in sync_groups.items()
+        for follower in followers
+    }
+    return follower_to_primary, set(follower_to_primary.keys())
+
+
+def apply_sync_followers_after_generation(
+    schedule: Dict[str, Dict[date, str]],
+    dates: List[date],
+    sync_groups: Dict[str, List[str]],
+    locked_assignments: Set[Tuple[str, date]],
+) -> None:
+    for primary, followers in sync_groups.items():
+        if primary not in schedule:
+            continue
+        for follower in followers:
+            if follower not in schedule:
+                continue
+            for dt in dates:
+                if (follower, dt) in locked_assignments:
+                    continue
+                # Preserve explicit leave-like statuses for the follower.
+                if is_leave_like_shift(schedule[follower].get(dt, SHIFT_UNASSIGNED)):
+                    continue
+                schedule[follower][dt] = schedule[primary].get(dt, SHIFT_WEEKOFF)
+
+
 def generate_auto_bank_holidays(start_date: date, end_date: date, count_per_month: int) -> Set[date]:
     holidays: Set[date] = set()
     if count_per_month <= 0:
@@ -1665,14 +1697,37 @@ def is_restricted_staffing_day(dt: date, bank_holidays: Set[date]) -> bool:
     return dt.weekday() >= 5 or dt in bank_holidays
 
 
+def can_partition_night_days(total_days: int) -> bool:
+    if total_days == 0:
+        return True
+    if total_days < MIN_CONTINUOUS_NIGHT:
+        return False
+
+    reachable = [False] * (total_days + 1)
+    reachable[0] = True
+    for current_total in range(1, total_days + 1):
+        reachable[current_total] = any(
+            current_total - block_len >= 0 and reachable[current_total - block_len]
+            for block_len in range(MIN_CONTINUOUS_NIGHT, MAX_CONTINUOUS_NIGHT + 1)
+        )
+    return reachable[total_days]
+
+
+def valid_night_block_length_candidates(remaining_days: int) -> List[int]:
+    if remaining_days < MIN_CONTINUOUS_NIGHT:
+        return []
+    candidates = [
+        block_len
+        for block_len in range(MIN_CONTINUOUS_NIGHT, MAX_CONTINUOUS_NIGHT + 1)
+        if block_len <= remaining_days and can_partition_night_days(remaining_days - block_len)
+    ]
+    # Prefer longer continuous blocks first so we don't exhaust members with many tiny blocks.
+    return sorted(candidates, reverse=True)
+
+
 def preferred_night_block_length(remaining_days: int) -> int:
-    if remaining_days <= 0:
-        return 0
-    if remaining_days == 1:
-        return 1
-    block_count = (remaining_days + MAX_CONTINUOUS_NIGHT - 1) // MAX_CONTINUOUS_NIGHT
-    base, extra = divmod(remaining_days, block_count)
-    return base + (1 if extra else 0)
+    candidates = valid_night_block_length_candidates(remaining_days)
+    return candidates[0] if candidates else 0
 
 
 def build_night_block_lengths(total_days: int, block_count: int) -> List[int]:
@@ -1680,9 +1735,11 @@ def build_night_block_lengths(total_days: int, block_count: int) -> List[int]:
         return []
     if block_count * MAX_CONTINUOUS_NIGHT < total_days:
         return []
+    if block_count * MIN_CONTINUOUS_NIGHT > total_days:
+        return []
     base, extra = divmod(total_days, block_count)
     lengths = [base + (1 if idx < extra else 0) for idx in range(block_count)]
-    if any(length <= 0 or length > MAX_CONTINUOUS_NIGHT for length in lengths):
+    if any(length < MIN_CONTINUOUS_NIGHT or length > MAX_CONTINUOUS_NIGHT for length in lengths):
         return []
     return lengths
 
@@ -1708,6 +1765,44 @@ def plan_night_lane_block_lengths(total_days: int, eligible_member_count: int) -
 
     lane_lengths = [build_night_block_lengths(total_days, count) for count in lane_block_counts]
     return lane_lengths, everyone_can_get_night_block
+
+
+def build_extra_night_block_candidates(
+    month_dates: List[date],
+    planned_night_primaries: Dict[date, List[str]],
+    fixed_night_count_by_day: Dict[date, int],
+    bank_holidays: Set[date],
+) -> List[List[date]]:
+    candidates: List[List[date]] = []
+    for start_idx, start_dt in enumerate(month_dates):
+        for block_len in range(MIN_CONTINUOUS_NIGHT, MAX_CONTINUOUS_NIGHT + 1):
+            end_idx = start_idx + block_len
+            if end_idx > len(month_dates):
+                break
+            block_dates = month_dates[start_idx:end_idx]
+            if any(
+                fixed_night_count_by_day.get(block_dt, 0) + len(planned_night_primaries[block_dt]) + 1
+                > max_shift_capacity_for_date(SHIFT_NIGHT, block_dt, bank_holidays)
+                for block_dt in block_dates
+            ):
+                continue
+            candidates.append(block_dates)
+
+    return sorted(
+        candidates,
+        key=lambda block_dates: (
+            -sum(
+                max(
+                    0,
+                    MIN_NIGHT - (fixed_night_count_by_day.get(block_dt, 0) + len(planned_night_primaries[block_dt])),
+                )
+                for block_dt in block_dates
+            ),
+            -len(block_dates),
+            sum(fixed_night_count_by_day.get(block_dt, 0) + len(planned_night_primaries[block_dt]) for block_dt in block_dates),
+            block_dates[0],
+        ),
+    )
 
 
 def pick_night_block_owner(
@@ -1798,177 +1893,673 @@ def plan_night_shift_blocks(
             night_day_count[name] += 1
             prev_dt = dt
 
-    primary_candidates = [name for name in member_names if not member_map[name].afternoon_only and name not in follower_to_primary]
-    fallback_candidates = [name for name in member_names if not member_map[name].afternoon_only]
+    def night_headcount_weight(name: str) -> int:
+        # Shift Sync followers are mirrored after the rota is generated, so a primary with followers
+        # effectively contributes extra headcount for staffing checks.
+        return 1 + len(sync_groups.get(name, []))
 
     for month, month_dates in sorted(month_dates_map.items()):
+        if not month_dates:
+            continue
+
         eligible_for_night = [
-            name for name in member_names
+            name
+            for name in member_names
             if not member_map[name].afternoon_only
         ]
-        fixed_night_count_by_day = {
-            dt: sum(1 for name in member_names if reservations[name].get(dt) == SHIFT_NIGHT)
+
+        # Hard cap for Night staffing can vary by calendar rules; default to MAX_NIGHT.
+        night_cap = {
+            dt: (max_shift_capacity_for_date(SHIFT_NIGHT, dt, bank_holidays) or MAX_NIGHT)
             for dt in month_dates
         }
-        remaining_standard_night_slots = sum(max(0, MIN_NIGHT - fixed_night_count_by_day[dt]) for dt in month_dates)
-        remaining_members_without_block = sum(1 for name in eligible_for_night if month_block_count[name].get(month, 0) == 0)
 
-        if remaining_members_without_block > remaining_standard_night_slots and eligible_for_night:
-            warnings.append({
-                "date": month_dates[0].isoformat(),
-                "warning": (
-                    "Night demand exceeds the standard 2-resource Night capacity for this month. "
-                    "The planner may use a 3rd Night resource on non-restricted days so more eligible members still receive a Night block."
-                ),
-            })
+        # If a member has a fixed (preassigned) Night block that is almost at the max continuous length,
+        # extending it by 1 day (when safe) can make month-level coverage feasible without breaking rules.
+        # This keeps the preassigned dates intact and only adds Night on an adjacent unassigned day.
+        for name in member_names:
+            if member_map[name].afternoon_only:
+                continue
 
-        for lane_index in range(MIN_NIGHT):
-            active_segment: List[date] = []
+            fixed_nights = [dt for dt in month_dates if reservations[name].get(dt) == SHIFT_NIGHT]
+            if not fixed_nights:
+                continue
 
-            def flush_segment(segment_dates: List[date]):
-                if not segment_dates:
-                    return
+            fixed_nights.sort()
+            runs: List[List[date]] = []
+            current: List[date] = []
+            prev_dt = None
+            for dt in fixed_nights:
+                if prev_dt is None or dt != prev_dt + timedelta(days=1):
+                    if current:
+                        runs.append(current)
+                    current = [dt]
+                else:
+                    current.append(dt)
+                prev_dt = dt
+            if current:
+                runs.append(current)
 
-                segment_pos = 0
-                while segment_pos < len(segment_dates):
-                    remaining_days = len(segment_dates) - segment_pos
-                    planned_len = preferred_night_block_length(remaining_days)
-                    chosen_name = None
-                    chosen_len = 0
-                    start_dt = segment_dates[segment_pos]
-                    global_start_index = date_index[start_dt]
-                    previous_dt = dates[global_start_index - 1] if global_start_index > 0 else None
-                    candidate_lengths = [planned_len]
-                    if planned_len > 1:
-                        candidate_lengths.extend(range(planned_len - 1, 0, -1))
-
-                    for block_len in candidate_lengths:
-                        block_dates = segment_dates[segment_pos: segment_pos + block_len]
-                        if len(block_dates) != block_len:
-                            continue
-                        global_end_index = date_index[block_dates[-1]]
-                        off_dates = dates[global_end_index + 1: min(global_end_index + 1 + MANDATORY_OFF_AFTER_NIGHT, len(dates))]
-
-                        for candidate_pool in (primary_candidates, fallback_candidates):
-                            chosen_name = pick_night_block_owner(
-                                candidates=candidate_pool,
-                                block_dates=block_dates,
-                                off_dates=off_dates,
-                                previous_dt=previous_dt,
-                                reservations=reservations,
-                                member_map=member_map,
-                                sync_groups=sync_groups,
-                                month=month,
-                                month_block_count=month_block_count,
-                                night_day_count=night_day_count,
-                            )
-                            if chosen_name:
-                                chosen_len = block_len
-                                break
-                        if chosen_name:
-                            break
-
-                    if chosen_name is None:
-                        warnings.append({
-                            "date": start_dt.isoformat(),
-                            "warning": "Night planner could not pre-assign a continuous block. Fallback day-level night allocation will be used.",
-                        })
-                        segment_pos += max(1, planned_len)
-                        continue
-
-                    if chosen_len == 1:
-                        warnings.append({
-                            "date": start_dt.isoformat(),
-                            "warning": f"Night planner assigned a 1-day night block to {chosen_name} because no longer continuous block was available.",
-                        })
-
-                    block_dates = segment_dates[segment_pos: segment_pos + chosen_len]
-                    global_end_index = date_index[block_dates[-1]]
-                    off_dates = dates[global_end_index + 1: min(global_end_index + 1 + MANDATORY_OFF_AFTER_NIGHT, len(dates))]
-
-                    if previous_dt and reservations[chosen_name].get(previous_dt) == SHIFT_UNASSIGNED:
-                        reservations[chosen_name][previous_dt] = SHIFT_WEEKOFF
-
-                    for dt in block_dates:
-                        reservations[chosen_name][dt] = SHIFT_NIGHT
-                        planned_night_primaries[dt].append(chosen_name)
-
-                    for dt in off_dates:
-                        if reservations[chosen_name].get(dt) == SHIFT_UNASSIGNED:
-                            reservations[chosen_name][dt] = SHIFT_WEEKOFF
-
-                    month_block_count[chosen_name][month] = month_block_count[chosen_name].get(month, 0) + 1
-                    night_day_count[chosen_name] += chosen_len
-                    segment_pos += chosen_len
-
-            for dt in month_dates:
-                remaining_need = max(0, MIN_NIGHT - fixed_night_count_by_day[dt])
-                if remaining_need > lane_index:
-                    active_segment.append(dt)
+            for run in runs:
+                if len(run) != (MAX_CONTINUOUS_NIGHT - 1):
                     continue
 
-                flush_segment(active_segment)
-                active_segment = []
+                start_dt = run[0]
+                end_dt = run[-1]
+                # Prefer extending earlier (keeps post-night rest aligned with the original end date).
+                try_before = start_dt - timedelta(days=1)
+                try_after = end_dt + timedelta(days=1)
 
-            flush_segment(active_segment)
+                extend_dt = None
+                if try_before in month_dates and reservations[name].get(try_before) == SHIFT_UNASSIGNED:
+                    extend_dt = try_before
+                elif try_after in month_dates and reservations[name].get(try_after) == SHIFT_UNASSIGNED:
+                    extend_dt = try_after
 
-        missing_night_members = [
-            name for name in eligible_for_night
-            if month_block_count[name].get(month, 0) == 0
-        ]
-        if missing_night_members:
-            extra_night_dates = sorted(
-                [dt for dt in month_dates if not is_restricted_staffing_day(dt, bank_holidays)],
-                reverse=True,
+                if extend_dt is None:
+                    continue
+
+                reservations[name][extend_dt] = SHIFT_NIGHT
+                # This added Night day is not part of the fixed preassignment, so ensure it gets assigned in the base rota.
+                planned_night_primaries[extend_dt].append(name)
+
+                # Reserve mandatory post-night rest after the block end.
+                new_end = end_dt if extend_dt == try_before else extend_dt
+                global_end_index = date_index[new_end]
+                off_dates = dates[
+                    global_end_index + 1: min(global_end_index + 1 + MANDATORY_OFF_AFTER_NIGHT, len(dates))
+                ]
+                for off_dt in off_dates:
+                    if reservations[name].get(off_dt) == SHIFT_UNASSIGNED:
+                        reservations[name][off_dt] = SHIFT_WEEKOFF
+
+                warnings.append(
+                    {
+                        "date": extend_dt.isoformat(),
+                        "warning": (
+                            f"Extended fixed Night block for {name} by 1 day on {extend_dt.isoformat()} "
+                            f"to help satisfy compulsory staffing without exceeding {MAX_CONTINUOUS_NIGHT} continuous Nights."
+                        ),
+                    }
+                )
+
+                # Only extend one block per member per month.
+                break
+
+        # Fixed Night assignments (preassigned shifts) already occupy capacity for the month planner.
+        fixed_effective_by_day: List[int] = []
+        for dt in month_dates:
+            fixed_effective_by_day.append(
+                sum(
+                    night_headcount_weight(name)
+                    for name in member_names
+                    if reservations[name].get(dt) == SHIFT_NIGHT
+                )
             )
-            for missing_name in missing_night_members:
-                assigned_extra_night = False
-                for extra_dt in extra_night_dates:
-                    planned_night_total = fixed_night_count_by_day.get(extra_dt, 0) + len(planned_night_primaries[extra_dt])
-                    if planned_night_total >= 3:
+
+        min_planned_required = [
+            max(0, MIN_NIGHT - fixed_effective_by_day[i])
+            for i in range(len(month_dates))
+        ]
+        max_planned_allowed = [
+            max(0, night_cap[month_dates[i]] - fixed_effective_by_day[i])
+            for i in range(len(month_dates))
+        ]
+
+        for i, dt in enumerate(month_dates):
+            if fixed_effective_by_day[i] > night_cap.get(dt, MAX_NIGHT):
+                warnings.append(
+                    {
+                        "date": dt.isoformat(),
+                        "warning": (
+                            f"{dt.isoformat()} already has fixed Night coverage of {fixed_effective_by_day[i]}, "
+                            f"which exceeds the maximum allowed {night_cap.get(dt, MAX_NIGHT)}."
+                        ),
+                    }
+                )
+
+        # Candidate members for Night planning: exclude afternoon-only and (if present) shift-sync followers.
+        planning_names = [
+            name
+            for name in eligible_for_night
+            if name not in follower_to_primary and month_block_count[name].get(month, 0) == 0
+        ]
+
+        if not planning_names:
+            if any(req > 0 for req in min_planned_required):
+                first_short = next(
+                    (month_dates[i] for i, req in enumerate(min_planned_required) if req > 0),
+                    month_dates[0],
+                )
+                warnings.append(
+                    {
+                        "date": first_short.isoformat(),
+                        "warning": (
+                            "Night planner has no eligible members available to start a continuous Night block, "
+                            "so compulsory minimum Night staffing may not be satisfied."
+                        ),
+                    }
+                )
+            continue
+
+        planning_index = {name: idx for idx, name in enumerate(planning_names)}
+        planning_weights = [night_headcount_weight(name) for name in planning_names]
+        month_len = len(month_dates)
+
+        # Precompute all valid block start lengths (4-6) for each member/day.
+        start_lengths: List[List[List[int]]] = [
+            [[] for _ in range(month_len)]
+            for _ in range(len(planning_names))
+        ]
+
+        for name, mi in planning_index.items():
+            weight = planning_weights[mi]
+            # Members whose effective weight exceeds MAX_NIGHT can never be placed on Night.
+            if weight > MAX_NIGHT:
+                continue
+
+            for start_idx in range(month_len):
+                start_dt = month_dates[start_idx]
+                global_start_index = date_index[start_dt]
+                previous_dt = dates[global_start_index - 1] if global_start_index > 0 else None
+                if previous_dt and reservations[name].get(previous_dt) == SHIFT_NIGHT:
+                    continue
+
+                for block_len in range(MAX_CONTINUOUS_NIGHT, MIN_CONTINUOUS_NIGHT - 1, -1):
+                    end_idx = start_idx + block_len
+                    if end_idx > month_len:
                         continue
 
-                    global_start_index = date_index[extra_dt]
-                    previous_dt = dates[global_start_index - 1] if global_start_index > 0 else None
+                    # Capacity check: this member alone must fit inside the planned capacity on every day in the block.
+                    if any(weight > max_planned_allowed[j] for j in range(start_idx, end_idx)):
+                        continue
+
+                    block_dates = month_dates[start_idx:end_idx]
+                    if any(
+                        reservations[name].get(block_dt, SHIFT_UNASSIGNED) != SHIFT_UNASSIGNED
+                        for block_dt in block_dates
+                    ):
+                        continue
+
+                    global_end_index = date_index[block_dates[-1]]
                     off_dates = dates[
-                        global_start_index + 1: min(global_start_index + 1 + MANDATORY_OFF_AFTER_NIGHT, len(dates))
+                        global_end_index + 1: min(global_end_index + 1 + MANDATORY_OFF_AFTER_NIGHT, len(dates))
                     ]
-                    chosen_name = pick_night_block_owner(
-                        candidates=[missing_name],
-                        block_dates=[extra_dt],
-                        off_dates=off_dates,
-                        previous_dt=previous_dt,
-                        reservations=reservations,
-                        member_map=member_map,
-                        sync_groups=sync_groups,
-                        month=month,
-                        month_block_count=month_block_count,
-                        night_day_count=night_day_count,
-                    )
-                    if not chosen_name:
+                    if any(
+                        reservations[name].get(off_dt, SHIFT_UNASSIGNED) in {SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT}
+                        for off_dt in off_dates
+                    ):
                         continue
 
-                    reservations[chosen_name][extra_dt] = SHIFT_NIGHT
-                    planned_night_primaries[extra_dt].append(chosen_name)
-                    fixed_night_count_by_day[extra_dt] = fixed_night_count_by_day.get(extra_dt, 0) + 1
-                    for off_dt in off_dates:
-                        if reservations[chosen_name].get(off_dt) == SHIFT_UNASSIGNED:
-                            reservations[chosen_name][off_dt] = SHIFT_WEEKOFF
+                    start_lengths[mi][start_idx].append(block_len)
 
-                    month_block_count[chosen_name][month] = month_block_count[chosen_name].get(month, 0) + 1
-                    night_day_count[chosen_name] += 1
-                    warnings.append({
-                        "date": extra_dt.isoformat(),
-                        "warning": f"Assigned a 3rd Night resource for {chosen_name} to keep Night allocation fair without breaking weekend or bank-holiday staffing rules.",
-                    })
-                    assigned_extra_night = True
-                    break
+        member_flex = [
+            sum(len(start_lengths[mi][d]) for d in range(month_len))
+            for mi in range(len(planning_names))
+        ]
+        initial_night_day_count = dict(night_day_count)
 
-                if not assigned_extra_night:
-                    warnings.append({
+        plannable_member_count = sum(1 for flex in member_flex if flex > 0)
+
+        weight_classes = sorted(set(planning_weights))
+        weight_to_index = {weight: idx for idx, weight in enumerate(weight_classes)}
+        available_counts_by_weight = tuple(
+            sum(1 for weight in planning_weights if weight == weight_class)
+            for weight_class in weight_classes
+        )
+
+        job_degree: List[Dict[int, Dict[int, int]]] = [
+            {
+                weight_class: {
+                    block_len: 0
+                    for block_len in range(MIN_CONTINUOUS_NIGHT, MAX_CONTINUOUS_NIGHT + 1)
+                }
+                for weight_class in weight_classes
+            }
+            for _ in range(month_len)
+        ]
+        for mi, weight in enumerate(planning_weights):
+            for start_idx in range(month_len):
+                for block_len in start_lengths[mi][start_idx]:
+                    job_degree[start_idx][weight][block_len] += 1
+
+        day_job_types: List[List[Tuple[int, int]]] = []
+        for start_idx in range(month_len):
+            keys: List[Tuple[int, int]] = []
+            for weight_class in sorted(weight_classes, reverse=True):
+                for block_len in range(MAX_CONTINUOUS_NIGHT, MIN_CONTINUOUS_NIGHT - 1, -1):
+                    if job_degree[start_idx][weight_class][block_len] > 0:
+                        keys.append((weight_class, block_len))
+            day_job_types.append(keys)
+
+        @lru_cache(maxsize=None)
+        def enumerate_start_sets(
+            day_idx: int,
+            remaining_counts: Tuple[int, ...],
+            remaining_jobs: int,
+            min_extra_weight: int,
+            max_extra_weight: int,
+        ) -> Tuple[Tuple[Tuple[int, int], ...], ...]:
+            if min_extra_weight > max_extra_weight:
+                return tuple()
+            if remaining_jobs <= 0:
+                return (tuple(),) if min_extra_weight <= 0 else tuple()
+
+            options: Set[Tuple[Tuple[int, int], ...]] = set()
+            type_keys = day_job_types[day_idx]
+            used_by_type: Dict[Tuple[int, int], int] = {}
+            used_by_weight = [0 for _ in weight_classes]
+
+            def walk(key_pos: int, current: List[Tuple[int, int]], current_weight: int):
+                if min_extra_weight <= current_weight <= max_extra_weight:
+                    options.add(tuple(current))
+                if current_weight >= max_extra_weight or len(current) >= remaining_jobs:
+                    return
+
+                for pos in range(key_pos, len(type_keys)):
+                    weight, block_len = type_keys[pos]
+                    if current_weight + weight > max_extra_weight:
+                        continue
+
+                    weight_idx = weight_to_index[weight]
+                    if used_by_weight[weight_idx] >= remaining_counts[weight_idx]:
+                        continue
+
+                    type_key = (weight, block_len)
+                    if used_by_type.get(type_key, 0) >= job_degree[day_idx][weight][block_len]:
+                        continue
+
+                    current.append((block_len, weight))
+                    used_by_weight[weight_idx] += 1
+                    used_by_type[type_key] = used_by_type.get(type_key, 0) + 1
+                    walk(pos, current, current_weight + weight)
+                    current.pop()
+                    used_by_weight[weight_idx] -= 1
+                    used_by_type[type_key] -= 1
+                    if used_by_type[type_key] <= 0:
+                        used_by_type.pop(type_key, None)
+
+            walk(0, [], 0)
+
+            return tuple(
+                sorted(
+                    options,
+                    key=lambda starts: (
+                        -sum(weight for _, weight in starts),
+                        -len(starts),
+                        -sum(block_len * weight for block_len, weight in starts),
+                        tuple((-weight, -block_len) for block_len, weight in starts),
+                    ),
+                )
+            )
+
+        jobs: List[Tuple[int, int, int]] = []
+        job_assigned_member: List[int] = []
+
+        for target_job_count in range(plannable_member_count, -1, -1):
+            StructureState = Tuple[int, Tuple[Tuple[int, int], ...], Tuple[int, ...], int]
+            structure_choice: Dict[StructureState, Tuple[Tuple[int, int], ...]] = {}
+
+            @lru_cache(maxsize=None)
+            def structure_dp(
+                day_idx: int,
+                active_jobs: Tuple[Tuple[int, int], ...],
+                used_counts: Tuple[int, ...],
+                jobs_started: int,
+            ) -> bool:
+                if day_idx >= month_len:
+                    return jobs_started == target_job_count
+
+                current_effective = sum(weight for _, weight in active_jobs)
+                min_req = min_planned_required[day_idx]
+                max_allow = max_planned_allowed[day_idx]
+                if current_effective > max_allow:
+                    return False
+
+                remaining_jobs = target_job_count - jobs_started
+                remaining_counts = tuple(
+                    available_counts_by_weight[idx] - used_counts[idx]
+                    for idx in range(len(weight_classes))
+                )
+                if remaining_jobs < 0 or sum(remaining_counts) < remaining_jobs:
+                    return False
+                if any(count < 0 for count in remaining_counts):
+                    return False
+
+                min_extra_weight = max(0, min_req - current_effective)
+                max_extra_weight = max_allow - current_effective
+                if remaining_jobs == 0:
+                    start_sets = (tuple(),) if min_extra_weight <= 0 else tuple()
+                else:
+                    start_sets = enumerate_start_sets(
+                        day_idx,
+                        remaining_counts,
+                        remaining_jobs,
+                        min_extra_weight,
+                        max_extra_weight,
+                    )
+
+                for starts in start_sets:
+                    next_used_counts = list(used_counts)
+                    for _, weight in starts:
+                        next_used_counts[weight_to_index[weight]] += 1
+
+                    next_active: List[Tuple[int, int]] = []
+                    for rem_len, weight in active_jobs:
+                        if rem_len - 1 > 0:
+                            next_active.append((rem_len - 1, weight))
+                    for block_len, weight in starts:
+                        if block_len - 1 > 0:
+                            next_active.append((block_len - 1, weight))
+                    next_state = tuple(
+                        sorted(
+                            next_active,
+                            key=lambda item: (-item[0], -item[1]),
+                        )
+                    )
+
+                    next_used_tuple = tuple(next_used_counts)
+                    next_jobs_started = jobs_started + len(starts)
+                    if structure_dp(day_idx + 1, next_state, next_used_tuple, next_jobs_started):
+                        structure_choice[(day_idx, active_jobs, used_counts, jobs_started)] = starts
+                        return True
+
+                return False
+
+            if not structure_dp(0, tuple(), tuple(0 for _ in weight_classes), 0):
+                continue
+
+            candidate_jobs: List[Tuple[int, int, int]] = []
+            day_idx = 0
+            active_jobs: Tuple[Tuple[int, int], ...] = tuple()
+            used_counts = tuple(0 for _ in weight_classes)
+            jobs_started = 0
+            while day_idx < month_len:
+                starts = structure_choice.get((day_idx, active_jobs, used_counts, jobs_started), tuple())
+                for block_len, weight in starts:
+                    candidate_jobs.append((day_idx, block_len, weight))
+
+                next_active: List[Tuple[int, int]] = []
+                for rem_len, weight in active_jobs:
+                    if rem_len - 1 > 0:
+                        next_active.append((rem_len - 1, weight))
+                next_used_counts = list(used_counts)
+                for block_len, weight in starts:
+                    next_used_counts[weight_to_index[weight]] += 1
+                    if block_len - 1 > 0:
+                        next_active.append((block_len - 1, weight))
+
+                active_jobs = tuple(
+                    sorted(
+                        next_active,
+                        key=lambda item: (-item[0], -item[1]),
+                    )
+                )
+                used_counts = tuple(next_used_counts)
+                jobs_started += len(starts)
+                day_idx += 1
+
+            candidate_job_to_members: List[List[int]] = []
+            for start_idx, block_len, weight in candidate_jobs:
+                candidate_job_to_members.append(
+                    [
+                        mi
+                        for mi in range(len(planning_names))
+                        if planning_weights[mi] == weight and block_len in start_lengths[mi][start_idx]
+                    ]
+                )
+
+            candidate_job_order = sorted(
+                range(len(candidate_jobs)),
+                key=lambda j: (
+                    len(candidate_job_to_members[j]),
+                    -candidate_jobs[j][2],
+                    candidate_jobs[j][0],
+                    -candidate_jobs[j][1],
+                ),
+            )
+
+            projected_total_night_days = (
+                sum(initial_night_day_count[name] for name in eligible_for_night) +
+                sum(block_len for _, block_len, _ in candidate_jobs)
+            )
+            fairness_target = (
+                projected_total_night_days / len(eligible_for_night)
+                if eligible_for_night else 0
+            )
+
+            used_members = [False] * len(planning_names)
+            candidate_assignment = [-1] * len(candidate_jobs)
+            assigned_night_days = {name: initial_night_day_count[name] for name in planning_names}
+
+            def can_finish_remaining(from_pos: int) -> bool:
+                future_jobs = candidate_job_order[from_pos:]
+                unused_members = {mi for mi in range(len(planning_names)) if not used_members[mi]}
+                for future_job in future_jobs:
+                    if not any(mi in unused_members for mi in candidate_job_to_members[future_job]):
+                        return False
+                return True
+
+            def assign_job(job_pos: int) -> bool:
+                if job_pos >= len(candidate_job_order):
+                    return True
+
+                job_index = candidate_job_order[job_pos]
+                start_idx, block_len, _ = candidate_jobs[job_index]
+                candidates = [
+                    mi
+                    for mi in candidate_job_to_members[job_index]
+                    if not used_members[mi]
+                ]
+                candidates = sorted(
+                    candidates,
+                    key=lambda mi: (
+                        abs((assigned_night_days[planning_names[mi]] + block_len) - fairness_target),
+                        assigned_night_days[planning_names[mi]] + block_len,
+                        member_flex[mi],
+                        start_idx,
+                        planning_names[mi].lower(),
+                    ),
+                )
+
+                for mi in candidates:
+                    name = planning_names[mi]
+                    used_members[mi] = True
+                    candidate_assignment[job_index] = mi
+                    assigned_night_days[name] += block_len
+                    if can_finish_remaining(job_pos + 1) and assign_job(job_pos + 1):
+                        return True
+                    assigned_night_days[name] -= block_len
+                    candidate_assignment[job_index] = -1
+                    used_members[mi] = False
+
+                return False
+
+            if assign_job(0):
+                jobs = candidate_jobs
+                job_assigned_member = candidate_assignment
+                break
+
+        if not jobs and any(req > 0 for req in min_planned_required):
+            failure_dt = month_dates[-1]
+            warnings.append(
+                {
+                    "date": failure_dt.isoformat(),
+                    "warning": (
+                        f"Night planner could not satisfy compulsory Night staffing ({MIN_NIGHT}-{MAX_NIGHT} resources) "
+                        f"while keeping Night blocks continuous for {MIN_CONTINUOUS_NIGHT}-{MAX_CONTINUOUS_NIGHT} days."
+                    ),
+                }
+            )
+            continue
+
+        for mi, flex in enumerate(member_flex):
+            if flex > 0:
+                continue
+            warnings.append(
+                {
+                    "date": month_dates[0].isoformat(),
+                    "warning": (
+                        f"{planning_names[mi]} has no valid {MIN_CONTINUOUS_NIGHT}-{MAX_CONTINUOUS_NIGHT} day Night block "
+                        f"available in this month after considering leave, preassignments, and compulsory rest."
+                    ),
+                }
+            )
+
+        # Apply matched blocks to reservations / primaries.
+        for job_index, (start_idx, block_len, _weight) in enumerate(jobs):
+            mi = job_assigned_member[job_index] if job_index < len(job_assigned_member) else -1
+            if mi is None or mi < 0:
+                continue
+            name = planning_names[mi]
+
+            block_dates = month_dates[start_idx: start_idx + block_len]
+            if not block_dates:
+                continue
+
+            global_start_index = date_index[block_dates[0]]
+            global_end_index = date_index[block_dates[-1]]
+            previous_dt = dates[global_start_index - 1] if global_start_index > 0 else None
+            off_dates = dates[
+                global_end_index + 1: min(global_end_index + 1 + MANDATORY_OFF_AFTER_NIGHT, len(dates))
+            ]
+
+            if previous_dt and reservations[name].get(previous_dt) == SHIFT_UNASSIGNED:
+                reservations[name][previous_dt] = SHIFT_WEEKOFF
+
+            for block_dt in block_dates:
+                reservations[name][block_dt] = SHIFT_NIGHT
+                planned_night_primaries[block_dt].append(name)
+
+            for off_dt in off_dates:
+                if reservations[name].get(off_dt) == SHIFT_UNASSIGNED:
+                    reservations[name][off_dt] = SHIFT_WEEKOFF
+
+            month_block_count[name][month] = month_block_count[name].get(month, 0) + 1
+            night_day_count[name] += len(block_dates)
+
+        # Recompute effective Night staffing after planning (fixed + planned) for extra-block placement.
+        night_effective_count: Dict[date, int] = {
+            dt: sum(
+                night_headcount_weight(name)
+                for name in member_names
+                if reservations[name].get(dt) == SHIFT_NIGHT
+            )
+            for dt in month_dates
+        }
+
+        # After meeting compulsory coverage, try to give remaining eligible members a Night block (as a 3rd resource) when possible.
+        remaining_without_block = sorted(
+            [
+                name for name in eligible_for_night
+                if name not in follower_to_primary and month_block_count[name].get(month, 0) == 0
+            ],
+            key=lambda name: (night_day_count[name], name.lower()),
+        )
+
+        for missing_name in remaining_without_block:
+            weight = night_headcount_weight(missing_name)
+            if weight > MAX_NIGHT:
+                continue
+
+            candidates: List[Tuple[List[date], date | None, List[date]]] = []
+            for start_idx in range(len(month_dates)):
+                for block_len in range(MAX_CONTINUOUS_NIGHT, MIN_CONTINUOUS_NIGHT - 1, -1):
+                    end_idx = start_idx + block_len
+                    if end_idx > len(month_dates):
+                        continue
+                    if any(weight > (night_cap.get(month_dates[j], MAX_NIGHT) - max(0, night_effective_count.get(month_dates[j], 0))) for j in range(start_idx, end_idx)):
+                        # This block would exceed per-day cap regardless of placement.
+                        continue
+
+                    block_dates = month_dates[start_idx:end_idx]
+                    if any(reservations[missing_name].get(block_dt, SHIFT_UNASSIGNED) != SHIFT_UNASSIGNED for block_dt in block_dates):
+                        continue
+
+                    global_start_index = date_index[block_dates[0]]
+                    global_end_index = date_index[block_dates[-1]]
+                    previous_dt = dates[global_start_index - 1] if global_start_index > 0 else None
+                    if previous_dt and reservations[missing_name].get(previous_dt) == SHIFT_NIGHT:
+                        continue
+
+                    off_dates = dates[
+                        global_end_index + 1: min(global_end_index + 1 + MANDATORY_OFF_AFTER_NIGHT, len(dates))
+                    ]
+                    if any(
+                        reservations[missing_name].get(off_dt, SHIFT_UNASSIGNED) in {SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT}
+                        for off_dt in off_dates
+                    ):
+                        continue
+                    candidates.append((block_dates, previous_dt, off_dates))
+
+            fairness_target = (
+                sum(night_day_count[name] for name in eligible_for_night) / len(eligible_for_night)
+                if eligible_for_night else 0
+            )
+            target_block_len = min(
+                MAX_CONTINUOUS_NIGHT,
+                max(
+                    MIN_CONTINUOUS_NIGHT,
+                    round(max(0, fairness_target - night_day_count[missing_name])),
+                ),
+            )
+
+            best_extra = None
+            best_extra_key = None
+            for block_dates, previous_dt, off_dates in candidates:
+                if any(
+                    night_effective_count.get(block_dt, 0) + weight > night_cap.get(block_dt, MAX_NIGHT)
+                    for block_dt in block_dates
+                ):
+                    continue
+                overflow = sum(
+                    max(0, (night_effective_count.get(block_dt, 0) + weight) - MIN_NIGHT)
+                    for block_dt in block_dates
+                )
+                key = (
+                    overflow,
+                    abs(len(block_dates) - target_block_len),
+                    abs((night_day_count[missing_name] + len(block_dates)) - fairness_target),
+                    -len(block_dates),
+                    block_dates[0],
+                )
+                if best_extra_key is None or key < best_extra_key:
+                    best_extra_key = key
+                    best_extra = (block_dates, previous_dt, off_dates)
+
+            if best_extra is None:
+                warnings.append(
+                    {
                         "date": month_dates[0].isoformat(),
                         "warning": f"Could not assign any Night block to {missing_name} without breaking the existing rota rules.",
-                    })
+                    }
+                )
+                continue
+
+            block_dates, previous_dt, off_dates = best_extra
+            if previous_dt and reservations[missing_name].get(previous_dt) == SHIFT_UNASSIGNED:
+                reservations[missing_name][previous_dt] = SHIFT_WEEKOFF
+
+            for block_dt in block_dates:
+                reservations[missing_name][block_dt] = SHIFT_NIGHT
+                planned_night_primaries[block_dt].append(missing_name)
+                night_effective_count[block_dt] = night_effective_count.get(block_dt, 0) + weight
+
+            for off_dt in off_dates:
+                if reservations[missing_name].get(off_dt) == SHIFT_UNASSIGNED:
+                    reservations[missing_name][off_dt] = SHIFT_WEEKOFF
+
+            month_block_count[missing_name][month] = month_block_count[missing_name].get(month, 0) + 1
+            night_day_count[missing_name] += len(block_dates)
+            warnings.append(
+                {
+                    "date": block_dates[0].isoformat(),
+                    "warning": (
+                        f"Assigned an extra Night block for {missing_name} from {block_dates[0].isoformat()} to {block_dates[-1].isoformat()} "
+                        f"as an additional Night resource (hard limit {MAX_NIGHT}) so more members receive a Night block."
+                    ),
+                }
+            )
 
     return planned_night_primaries, reservations, warnings
 
@@ -2116,6 +2707,400 @@ def can_grant_balanced_weekoff(
     return False
 
 
+def get_day_shift_counts(schedule: Dict[str, Dict[date, str]], member_names: List[str], dt: date) -> Dict[str, int]:
+    return {
+        SHIFT_MORNING: sum(schedule[name][dt] == SHIFT_MORNING for name in member_names),
+        SHIFT_AFTERNOON: sum(schedule[name][dt] == SHIFT_AFTERNOON for name in member_names),
+        SHIFT_NIGHT: sum(schedule[name][dt] == SHIFT_NIGHT for name in member_names),
+    }
+
+
+def max_shift_capacity_for_date(shift: str, dt: date, bank_holidays: Set[date]) -> Optional[int]:
+    if shift not in {SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT}:
+        return None
+    # Nights can go up to the hard cap (MAX_NIGHT) even on weekends/bank holidays.
+    # Restricted-day caps apply primarily to daytime shifts.
+    if shift == SHIFT_NIGHT:
+        return MAX_NIGHT
+    if is_restricted_staffing_day(dt, bank_holidays):
+        return 2
+    return daily_shift_cap(shift)
+
+
+def member_assignment_is_valid(
+    schedule: Dict[str, Dict[date, str]],
+    member: str,
+    dates: List[date],
+    member_map: Dict[str, Member],
+    enforce_post_night_rest: bool = True,
+    allow_multiple_night_blocks: bool = False,
+) -> bool:
+    member_info = member_map[member]
+    shifts = [schedule[member][dt] for dt in dates]
+
+    work_streak = 0
+    for idx, shift in enumerate(shifts):
+        dt = dates[idx]
+        if member_info.afternoon_only:
+            if dt.weekday() >= 5 and is_working_shift(shift):
+                return False
+            if dt.weekday() < 5 and shift in {SHIFT_MORNING, SHIFT_NIGHT}:
+                return False
+
+        if is_working_shift(shift):
+            work_streak += 1
+            if work_streak > MAX_CONTINUOUS_WORKING_DAYS:
+                return False
+        else:
+            work_streak = 0
+
+    monthly_night_blocks: Dict[Tuple[int, int], int] = {}
+    idx = 0
+    while idx < len(dates):
+        if shifts[idx] != SHIFT_NIGHT:
+            idx += 1
+            continue
+
+        block_start = idx
+        block_month = month_key(dates[idx])
+        while idx + 1 < len(dates) and shifts[idx + 1] == SHIFT_NIGHT:
+            if month_key(dates[idx + 1]) != block_month:
+                return False
+            idx += 1
+        block_end = idx
+        block_length = block_end - block_start + 1
+        if block_length < MIN_CONTINUOUS_NIGHT:
+            return False
+        if block_length > MAX_CONTINUOUS_NIGHT:
+            return False
+
+        monthly_night_blocks[block_month] = monthly_night_blocks.get(block_month, 0) + 1
+        if not allow_multiple_night_blocks and monthly_night_blocks[block_month] > 1:
+            return False
+
+        if enforce_post_night_rest:
+            for follow_idx in range(block_end + 1, min(block_end + 1 + MANDATORY_OFF_AFTER_NIGHT, len(dates))):
+                follow_shift = shifts[follow_idx]
+                if follow_shift != SHIFT_WEEKOFF and not is_leave_like_shift(follow_shift):
+                    return False
+
+        idx += 1
+
+    return True
+
+
+def can_reassign_member_for_shift_repair(
+    schedule: Dict[str, Dict[date, str]],
+    member_names: List[str],
+    member: str,
+    dt: date,
+    new_shift: str,
+    dates: List[date],
+    member_map: Dict[str, Member],
+    bank_holidays: Set[date],
+    locked_assignments: Set[Tuple[str, date]],
+    protected_weekoffs: Set[Tuple[str, date]],
+    allow_multiple_night_blocks: bool = False,
+) -> bool:
+    current_shift = schedule[member][dt]
+    if current_shift == new_shift:
+        return False
+    if current_shift in LEAVE_LIKE_SHIFTS or current_shift == SHIFT_LEAVE:
+        return False
+    if (member, dt) in locked_assignments:
+        return False
+    if current_shift == SHIFT_WEEKOFF and (member, dt) in protected_weekoffs:
+        return False
+    if current_shift == SHIFT_NIGHT and new_shift != SHIFT_NIGHT:
+        return False
+
+    day_counts = get_day_shift_counts(schedule, member_names, dt)
+    if current_shift in {SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT}:
+        minimum = {
+            SHIFT_MORNING: MIN_MORNING,
+            SHIFT_AFTERNOON: MIN_AFTERNOON,
+            SHIFT_NIGHT: MIN_NIGHT,
+        }[current_shift]
+        if day_counts[current_shift] - 1 < minimum:
+            return False
+
+    target_cap = max_shift_capacity_for_date(new_shift, dt, bank_holidays)
+    if target_cap is not None and day_counts[new_shift] + 1 > target_cap:
+        return False
+
+    schedule[member][dt] = new_shift
+    try:
+        if new_shift == SHIFT_NIGHT:
+            return member_assignment_is_valid(
+                schedule,
+                member,
+                dates,
+                member_map,
+                enforce_post_night_rest=False,
+                allow_multiple_night_blocks=allow_multiple_night_blocks,
+            )
+        return member_assignment_is_valid(
+            schedule,
+            member,
+            dates,
+            member_map,
+            enforce_post_night_rest=True,
+            allow_multiple_night_blocks=allow_multiple_night_blocks,
+        )
+    finally:
+        schedule[member][dt] = current_shift
+
+
+def repair_daily_shift_shortages(
+    schedule: Dict[str, Dict[date, str]],
+    member_names: List[str],
+    dates: List[date],
+    member_map: Dict[str, Member],
+    bank_holidays: Set[date],
+    locked_assignments: Set[Tuple[str, date]],
+    protected_weekoffs: Set[Tuple[str, date]],
+    warnings: List[dict],
+) -> bool:
+    changed = False
+    for day_index, dt in enumerate(dates):
+        stats_map = {name: compute_stats_before_day(schedule, dates, day_index, name) for name in member_names}
+        for target_shift, minimum in ((SHIFT_NIGHT, MIN_NIGHT), (SHIFT_AFTERNOON, MIN_AFTERNOON), (SHIFT_MORNING, MIN_MORNING)):
+            while get_day_shift_counts(schedule, member_names, dt)[target_shift] < minimum:
+                day_counts = get_day_shift_counts(schedule, member_names, dt)
+
+                def ordered_candidates() -> List[str]:
+                    candidates: List[str] = []
+                    seen: Set[str] = set()
+
+                    def add_members(pool: List[str]):
+                        for name in pool:
+                            if name in seen:
+                                continue
+                            seen.add(name)
+                            candidates.append(name)
+
+                    if target_shift == SHIFT_AFTERNOON:
+                        add_members([name for name in member_names if schedule[name][dt] == SHIFT_MORNING and day_counts[SHIFT_MORNING] > MIN_MORNING])
+                        add_members([name for name in member_names if schedule[name][dt] == SHIFT_WEEKOFF])
+                        add_members([name for name in member_names if schedule[name][dt] == SHIFT_MORNING])
+                    elif target_shift == SHIFT_MORNING:
+                        add_members([name for name in member_names if schedule[name][dt] == SHIFT_AFTERNOON and day_counts[SHIFT_AFTERNOON] > MIN_AFTERNOON])
+                        add_members([name for name in member_names if schedule[name][dt] == SHIFT_WEEKOFF])
+                        add_members([name for name in member_names if schedule[name][dt] == SHIFT_AFTERNOON])
+                    else:
+                        add_members(
+                            sorted(
+                                [name for name in member_names if schedule[name][dt] in {SHIFT_WEEKOFF, SHIFT_MORNING, SHIFT_AFTERNOON} and stats_map[name]["prev_shift"] == SHIFT_NIGHT],
+                                key=lambda name: (schedule[name][dt] != SHIFT_WEEKOFF, name.lower()),
+                            )
+                        )
+                        add_members(
+                            sorted(
+                                [name for name in member_names if schedule[name][dt] in {SHIFT_WEEKOFF, SHIFT_MORNING, SHIFT_AFTERNOON}
+                                 and day_index + 1 < len(dates) and schedule[name][dates[day_index + 1]] == SHIFT_NIGHT],
+                                key=lambda name: (schedule[name][dt] != SHIFT_WEEKOFF, name.lower()),
+                            )
+                        )
+                        add_members(
+                            sorted(
+                                [
+                                    name for name in member_names
+                                    if schedule[name][dt] == SHIFT_WEEKOFF and stats_map[name]["month_night_blocks"] == 0
+                                ],
+                                key=str.lower,
+                            )
+                        )
+                        add_members(
+                            sorted(
+                                [
+                                    name for name in member_names
+                                    if schedule[name][dt] in {SHIFT_MORNING, SHIFT_AFTERNOON}
+                                    and stats_map[name]["month_night_blocks"] == 0
+                                    and day_counts[schedule[name][dt]] > {
+                                        SHIFT_MORNING: MIN_MORNING,
+                                        SHIFT_AFTERNOON: MIN_AFTERNOON,
+                                    }[schedule[name][dt]]
+                                ],
+                                key=lambda name: (schedule[name][dt] != SHIFT_WEEKOFF, name.lower()),
+                            )
+                        )
+                        add_members([name for name in member_names if schedule[name][dt] == SHIFT_WEEKOFF])
+                        add_members([name for name in member_names if schedule[name][dt] in {SHIFT_MORNING, SHIFT_AFTERNOON}])
+                    return candidates
+
+                selected_candidate = None
+                for candidate in ordered_candidates():
+                    if can_reassign_member_for_shift_repair(
+                        schedule,
+                        member_names,
+                        candidate,
+                        dt,
+                        target_shift,
+                        dates,
+                        member_map,
+                        bank_holidays,
+                        locked_assignments,
+                        protected_weekoffs,
+                    ):
+                        selected_candidate = candidate
+                        break
+
+                if selected_candidate is None and target_shift == SHIFT_NIGHT:
+                    for candidate in ordered_candidates():
+                        if can_reassign_member_for_shift_repair(
+                            schedule,
+                            member_names,
+                            candidate,
+                            dt,
+                            target_shift,
+                            dates,
+                            member_map,
+                            bank_holidays,
+                            locked_assignments,
+                            protected_weekoffs,
+                            allow_multiple_night_blocks=True,
+                        ):
+                            selected_candidate = candidate
+                            warnings.append(
+                                {
+                                    "date": dt.isoformat(),
+                                    "warning": (
+                                        f"Repair used an additional Night block for {candidate} on {dt.isoformat()} "
+                                        "to satisfy the hard minimum Night coverage."
+                                    ),
+                                }
+                            )
+                            break
+
+                if selected_candidate is None:
+                    warnings.append(
+                        {
+                            "date": dt.isoformat(),
+                            "warning": f"Repair could not raise {target_shift} staffing to {minimum} on {dt.isoformat()} without breaking another rota rule.",
+                        }
+                    )
+                    break
+
+                previous_shift = schedule[selected_candidate][dt]
+                schedule[selected_candidate][dt] = target_shift
+                changed = True
+                warnings.append(
+                    {
+                        "date": dt.isoformat(),
+                        "warning": f"Repair moved {selected_candidate} from {previous_shift} to {target_shift} on {dt.isoformat()} to restore staffing coverage.",
+                    }
+                )
+
+    return changed
+
+
+def repair_post_night_rest_violations(
+    schedule: Dict[str, Dict[date, str]],
+    member_names: List[str],
+    dates: List[date],
+    member_map: Dict[str, Member],
+    locked_assignments: Set[Tuple[str, date]],
+    protected_weekoffs: Set[Tuple[str, date]],
+    warnings: List[dict],
+) -> bool:
+    changed = False
+    for name in member_names:
+        idx = 0
+        while idx < len(dates):
+            if schedule[name][dates[idx]] != SHIFT_NIGHT:
+                idx += 1
+                continue
+            while idx + 1 < len(dates) and schedule[name][dates[idx + 1]] == SHIFT_NIGHT:
+                idx += 1
+            block_end = idx
+            for follow_idx in range(block_end + 1, min(block_end + 1 + MANDATORY_OFF_AFTER_NIGHT, len(dates))):
+                follow_dt = dates[follow_idx]
+                follow_shift = schedule[name][follow_dt]
+                if follow_shift in {SHIFT_WEEKOFF} or is_leave_like_shift(follow_shift):
+                    continue
+                if (name, follow_dt) in locked_assignments:
+                    continue
+                schedule[name][follow_dt] = SHIFT_WEEKOFF
+                protected_weekoffs.add((name, follow_dt))
+                changed = True
+                warnings.append(
+                    {
+                        "date": follow_dt.isoformat(),
+                        "warning": f"Repair changed {name} to Week Off on {follow_dt.isoformat()} to preserve the compulsory post-Night rest window.",
+                    }
+                )
+            idx += 1
+    return changed
+
+
+def repair_excessive_work_streaks(
+    schedule: Dict[str, Dict[date, str]],
+    member_names: List[str],
+    dates: List[date],
+    member_map: Dict[str, Member],
+    locked_assignments: Set[Tuple[str, date]],
+    protected_weekoffs: Set[Tuple[str, date]],
+    warnings: List[dict],
+) -> bool:
+    changed = False
+    for name in member_names:
+        idx = 0
+        while idx < len(dates):
+            if not is_working_shift(schedule[name][dates[idx]]):
+                idx += 1
+                continue
+
+            start_idx = idx
+            while idx + 1 < len(dates) and is_working_shift(schedule[name][dates[idx + 1]]):
+                idx += 1
+            end_idx = idx
+            streak_length = end_idx - start_idx + 1
+            if streak_length <= MAX_CONTINUOUS_WORKING_DAYS:
+                idx += 1
+                continue
+
+            candidate_indices = sorted(
+                range(start_idx, end_idx + 1),
+                key=lambda candidate_idx: (
+                    schedule[name][dates[candidate_idx]] == SHIFT_NIGHT,
+                    abs(candidate_idx - ((start_idx + end_idx) // 2)),
+                    dates[candidate_idx],
+                ),
+            )
+            changed_this_streak = False
+            for candidate_idx in candidate_indices:
+                candidate_dt = dates[candidate_idx]
+                current_shift = schedule[name][candidate_dt]
+                if current_shift not in {SHIFT_MORNING, SHIFT_AFTERNOON}:
+                    continue
+                if (name, candidate_dt) in locked_assignments:
+                    continue
+                schedule[name][candidate_dt] = SHIFT_WEEKOFF
+                if member_assignment_is_valid(schedule, name, dates, member_map, enforce_post_night_rest=True):
+                    protected_weekoffs.add((name, candidate_dt))
+                    changed = True
+                    changed_this_streak = True
+                    warnings.append(
+                        {
+                            "date": candidate_dt.isoformat(),
+                            "warning": f"Repair changed {name} to Week Off on {candidate_dt.isoformat()} to keep continuous working days within the allowed limit.",
+                        }
+                    )
+                    break
+                schedule[name][candidate_dt] = current_shift
+
+            if not changed_this_streak:
+                warnings.append(
+                    {
+                        "date": dates[start_idx].isoformat(),
+                        "warning": f"Repair could not break {name}'s continuous working streak from {dates[start_idx].isoformat()} to {dates[end_idx].isoformat()} without breaking another rule.",
+                    }
+                )
+
+            idx = end_idx + 1
+    return changed
+
+
 def rebalance_weekoff_targets(
     schedule: Dict[str, Dict[date, str]],
     member_names: List[str],
@@ -2124,6 +3109,7 @@ def rebalance_weekoff_targets(
     bank_holidays: Set[date],
     member_map: Dict[str, Member],
     locked_assignments: Set[Tuple[str, date]],
+    additional_locked_weekoffs: Optional[Set[Tuple[str, date]]] = None,
 ):
     locked_weekoffs: Set[Tuple[str, date]] = set()
     date_index = {dt: idx for idx, dt in enumerate(dates)}
@@ -2145,6 +3131,9 @@ def rebalance_weekoff_targets(
                     future_dt = dates[future_idx]
                     if schedule[name][future_dt] == SHIFT_WEEKOFF:
                         locked_weekoffs.add((name, future_dt))
+
+    if additional_locked_weekoffs:
+        locked_weekoffs.update(additional_locked_weekoffs)
 
     month_wo = {
         name: sum(1 for dt in dates if schedule[name][dt] == SHIFT_WEEKOFF)
@@ -2301,11 +3290,17 @@ def assign_shift_with_sync(
     member_map: Dict[str, Member],
     sync_groups: Dict[str, List[str]],
     warnings: List[dict],
+    *,
+    count_member_names: List[str] | None = None,
 ):
+    def current_shift_count() -> int:
+        if count_member_names is None:
+            return sum(member_schedule.get(dt) == shift for member_schedule in schedule.values())
+        return sum(schedule.get(name, {}).get(dt) == shift for name in count_member_names)
+
     for primary in selected_names:
         shift_cap = daily_shift_cap(shift)
-        current_shift_count = sum(member_schedule.get(dt) == shift for member_schedule in schedule.values())
-        if shift_cap is not None and current_shift_count >= shift_cap:
+        if shift_cap is not None and current_shift_count() >= shift_cap:
             warnings.append({
                 "date": dt.isoformat(),
                 "warning": f"{shift} reached the maximum allowed {shift_cap} resources, so {primary} was not assigned.",
@@ -2316,8 +3311,7 @@ def assign_shift_with_sync(
         schedule[primary][dt] = shift
         shift_counts[shift][primary] += 1
         for follower in sync_groups.get(primary, []):
-            current_shift_count = sum(member_schedule.get(dt) == shift for member_schedule in schedule.values())
-            if shift_cap is not None and current_shift_count >= shift_cap:
+            if shift_cap is not None and current_shift_count() >= shift_cap:
                 warnings.append({
                     "date": dt.isoformat(),
                     "warning": f"Sync not possible: {follower} could not match {primary}'s {shift} shift because the daily {shift} limit of {shift_cap} was reached.",
@@ -2642,6 +3636,10 @@ def build_rota_validation_report(
     dates = [datetime.strptime(col, "%Y-%m-%d").date() for col in date_cols]
     afternoon_only_names = {normalize_text_input(name) for name in (afternoon_only_names or set()) if normalize_text_input(name)}
     sync_groups = sync_groups or derive_sync_groups_from_full_df(normalized_full_df)
+    # Followers are treated as extra resources (mirrored after base rota generation),
+    # so daily staffing validation should include them.
+    staffing_df = normalized_full_df
+
     row_lookup = {
         normalize_text_input(row.get("name", "")): row
         for _, row in normalized_full_df.iterrows()
@@ -2672,7 +3670,7 @@ def build_rota_validation_report(
         )
 
     for col, dt in zip(date_cols, dates):
-        counts = normalized_full_df[col].value_counts(dropna=False).to_dict()
+        counts = staffing_df[col].value_counts(dropna=False).to_dict()
         for shift_name, minimum in (
             (SHIFT_MORNING, MIN_MORNING),
             (SHIFT_AFTERNOON, MIN_AFTERNOON),
@@ -2702,7 +3700,7 @@ def build_rota_validation_report(
                 )
 
         if is_restricted_staffing_day(dt, bank_holidays):
-            for shift_name in (SHIFT_MORNING, SHIFT_AFTERNOON, SHIFT_NIGHT):
+            for shift_name in (SHIFT_MORNING, SHIFT_AFTERNOON):
                 assigned = int(counts.get(shift_name, 0))
                 if assigned > 2:
                     add_issue(
@@ -2809,6 +3807,16 @@ def build_rota_validation_report(
                 )
 
             monthly_night_blocks.setdefault(month_key(block_dates[0]), []).append((block_start, block_end))
+
+            if len(block_dates) < MIN_CONTINUOUS_NIGHT:
+                add_issue(
+                    "Error",
+                    "Member",
+                    member_name,
+                    block_dates[0],
+                    "Minimum continuous Night shifts",
+                    f"{member_name} has a Night block from {block_dates[0].isoformat()} to {block_dates[-1].isoformat()} ({len(block_dates)} days), below the required minimum of {MIN_CONTINUOUS_NIGHT}.",
+                )
 
             if len(block_dates) > MAX_CONTINUOUS_NIGHT:
                 add_issue(
@@ -3118,6 +4126,11 @@ def parse_preassigned_shifts(
             block_start = ordered_nights[0]
             block_end = ordered_nights[-1]
             block_dates = dates_in_range(block_start, block_end)
+            if len(block_dates) < MIN_CONTINUOUS_NIGHT:
+                raise ValueError(
+                    f"{name} has preassigned Night shifts spanning {len(block_dates)} days in {month[0]}-{month[1]:02d}. "
+                    f"Night blocks must be at least {MIN_CONTINUOUS_NIGHT} continuous days."
+                )
             if len(block_dates) > MAX_CONTINUOUS_NIGHT:
                 raise ValueError(
                     f"{name} has preassigned Night shifts spanning {len(block_dates)} days in {month[0]}-{month[1]:02d}. "
@@ -3337,7 +4350,10 @@ def generate_rota(
     member_names = [m.name for m in members]
     member_map = {m.name: m for m in members}
     targets = prorated_target(global_weekoffs_per_month, start_date, end_date)
-    follower_to_primary = {follower: primary for primary, followers in sync_groups.items() for follower in followers}
+    follower_to_primary, follower_names = sync_group_maps(sync_groups)
+    staffing_members = [m for m in members if m.name not in follower_names]
+    staffing_names = [m.name for m in staffing_members]
+    assignment_sync_groups: Dict[str, List[str]] = {}
 
     schedule: Dict[str, Dict[date, str]] = {m.name: {d: SHIFT_UNASSIGNED for d in dates} for m in members}
     locked_assignments: Set[Tuple[str, date]] = set()
@@ -3348,7 +4364,7 @@ def generate_rota(
     }
     warnings: List[dict] = []
     planned_night_primaries, night_reservations, planning_warnings = plan_night_shift_blocks(
-        members,
+        staffing_members,
         leaves,
         dates,
         sync_groups,
@@ -3380,16 +4396,21 @@ def generate_rota(
         month = month_key(dt)
         target_wo = targets[month]
         restricted_staffing_day = is_restricted_staffing_day(dt, bank_holidays)
-        stats_map = {name: compute_stats_before_day(schedule, dates, day_index, name) for name in member_names}
+        stats_map = {name: compute_stats_before_day(schedule, dates, day_index, name) for name in staffing_names}
         month_wo_count = {
             name: stats_map[name]["month_wo"] + (1 if schedule[name][dt] == SHIFT_WEEKOFF else 0)
-            for name in member_names
+            for name in staffing_names
         }
 
-        for name in member_names:
-            if night_reservations[name].get(dt) == SHIFT_WEEKOFF and schedule[name][dt] == SHIFT_UNASSIGNED:
+        for name in staffing_names:
+            if night_reservations.get(name, {}).get(dt) == SHIFT_WEEKOFF and schedule[name][dt] == SHIFT_UNASSIGNED:
                 schedule[name][dt] = SHIFT_WEEKOFF
                 month_wo_count[name] += 1
+
+        # Followers are treated as extra resources and mirrored after base rota generation.
+        for follower in follower_names:
+            if schedule[follower][dt] == SHIFT_UNASSIGNED:
+                schedule[follower][dt] = SHIFT_WEEKOFF
 
         planned_primary_names = planned_night_primaries.get(dt, [])
         if planned_primary_names:
@@ -3401,13 +4422,14 @@ def generate_rota(
                 shift_counts,
                 stats_map,
                 member_map,
-                sync_groups,
+                assignment_sync_groups,
                 warnings,
+                count_member_names=staffing_names,
             )
 
         available = []
         forced_wo = []
-        for name in member_names:
+        for name in staffing_names:
             current_status = schedule[name][dt]
             if current_status != SHIFT_UNASSIGNED:
                 continue
@@ -3423,11 +4445,11 @@ def generate_rota(
                 schedule[name][dt] = SHIFT_WEEKOFF
                 month_wo_count[name] += 1
 
-        available = [n for n in member_names if schedule[n][dt] == SHIFT_UNASSIGNED]
+        available = [n for n in staffing_names if schedule[n][dt] == SHIFT_UNASSIGNED]
         current_day_shift_counts = {
-            SHIFT_MORNING: sum(schedule[n][dt] == SHIFT_MORNING for n in member_names),
-            SHIFT_AFTERNOON: sum(schedule[n][dt] == SHIFT_AFTERNOON for n in member_names),
-            SHIFT_NIGHT: sum(schedule[n][dt] == SHIFT_NIGHT for n in member_names),
+            SHIFT_MORNING: sum(schedule[n][dt] == SHIFT_MORNING for n in staffing_names),
+            SHIFT_AFTERNOON: sum(schedule[n][dt] == SHIFT_AFTERNOON for n in staffing_names),
+            SHIFT_NIGHT: sum(schedule[n][dt] == SHIFT_NIGHT for n in staffing_names),
         }
         remaining_required = (
             max(0, MIN_MORNING - current_day_shift_counts[SHIFT_MORNING]) +
@@ -3458,10 +4480,9 @@ def generate_rota(
                 month_wo_count[pick] += 1
                 if pick in available:
                     available.remove(pick)
-                # if primary gets WO, try keeping synced followers available for staffing; sync can break if needed
                 candidates_for_wo = [n for n in available if not member_map[n].afternoon_only and n not in follower_to_primary]
 
-        available = [n for n in member_names if schedule[n][dt] == SHIFT_UNASSIGNED]
+        available = [n for n in staffing_names if schedule[n][dt] == SHIFT_UNASSIGNED]
         if len(available) < remaining_required:
             warnings.append({"date": dt.isoformat(), "warning": f"Only {len(available)} available resources. Minimum {remaining_required} still required."})
 
@@ -3475,22 +4496,22 @@ def generate_rota(
             shift_counts,
             stats_map,
             member_map,
-            sync_groups,
+            assignment_sync_groups,
             warnings,
+            count_member_names=staffing_names,
         )
 
-        available = [n for n in member_names if schedule[n][dt] == SHIFT_UNASSIGNED]
+        available = [n for n in staffing_names if schedule[n][dt] == SHIFT_UNASSIGNED]
 
         # The planner pre-assigns continuous Night blocks. This fallback only runs if the
         # preplanned owners could not cover the required Night staffing for the day.
-        current_night_count = sum(schedule[n][dt] == SHIFT_NIGHT for n in member_names)
+        current_night_count = sum(schedule[n][dt] == SHIFT_NIGHT for n in staffing_names)
         remaining_night_need = max(0, MIN_NIGHT - current_night_count)
         if remaining_night_need > 0:
-            fallback_pool = [n for n in member_names if schedule[n][dt] == SHIFT_UNASSIGNED]
             if day_index > 0:
                 y = dates[day_index - 1]
                 continuing_night = [
-                    n for n in member_names
+                    n for n in staffing_names
                     if schedule[n][y] == SHIFT_NIGHT and can_assign_shift(n, SHIFT_NIGHT, dt, schedule, stats_map, member_map)
                 ]
                 continuing_night = sorted(
@@ -3505,28 +4526,7 @@ def generate_rota(
             else:
                 continuing_night = []
 
-            remaining_after_continuity = max(0, remaining_night_need - len(continuing_night))
-            starter_pool = [
-                n for n in fallback_pool
-                if n not in continuing_night
-                and n not in follower_to_primary
-                and stats_map[n]["prev_shift"] != SHIFT_NIGHT
-                and stats_map[n]["month_night_blocks"] == 0
-            ]
-            if len(starter_pool) < remaining_after_continuity:
-                starter_pool = [
-                    n for n in fallback_pool
-                    if n not in continuing_night
-                    and stats_map[n]["prev_shift"] != SHIFT_NIGHT
-                    and stats_map[n]["month_night_blocks"] == 0
-                ]
-
             night_selected = continuing_night[:remaining_night_need]
-            if len(night_selected) < remaining_night_need:
-                needed_starters = remaining_night_need - len(night_selected)
-                night_selected.extend(
-                    choose_shift_candidates(starter_pool, SHIFT_NIGHT, needed_starters, stats_map, shift_counts)
-                )
             assign_shift_with_sync(
                 SHIFT_NIGHT,
                 night_selected,
@@ -3535,19 +4535,30 @@ def generate_rota(
                 shift_counts,
                 stats_map,
                 member_map,
-                sync_groups,
+                assignment_sync_groups,
                 warnings,
+                count_member_names=staffing_names,
             )
+            if len(night_selected) < remaining_night_need:
+                warnings.append(
+                    {
+                        "date": dt.isoformat(),
+                        "warning": (
+                            f"Night remained short on {dt.isoformat()} because the fallback allocator will not start a new "
+                            f"Night block unless it can stay continuous for {MIN_CONTINUOUS_NIGHT}-{MAX_CONTINUOUS_NIGHT} days."
+                        ),
+                    }
+                )
 
         # Once today's night assignment is known, enforce post-night rest before filling other shifts.
         if day_index > 0:
             y = dates[day_index - 1]
-            for n in member_names:
+            for n in staffing_names:
                 if schedule[n][y] == SHIFT_NIGHT and schedule[n][dt] == SHIFT_UNASSIGNED:
                     apply_night_block_offs(schedule, n, dates, day_index - 1, 1)
 
         # A maxed-out night streak immediately reserves the next 2 days as WO.
-        for n in member_names:
+        for n in staffing_names:
             if schedule[n][dt] == SHIFT_NIGHT:
                 current_night_streak = 0
                 idx = day_index
@@ -3557,25 +4568,25 @@ def generate_rota(
                 if current_night_streak >= MAX_CONTINUOUS_NIGHT:
                     apply_night_block_offs(schedule, n, dates, day_index, 1)
 
-        available = [n for n in member_names if schedule[n][dt] == SHIFT_UNASSIGNED]
+        available = [n for n in staffing_names if schedule[n][dt] == SHIFT_UNASSIGNED]
         morning_pool = [n for n in available if n not in follower_to_primary]
-        current_morning_count = sum(schedule[n][dt] == SHIFT_MORNING for n in member_names)
+        current_morning_count = sum(schedule[n][dt] == SHIFT_MORNING for n in staffing_names)
         morning_need = max(0, MIN_MORNING - current_morning_count)
         if len(morning_pool) < morning_need:
             morning_pool = available
         morning_selected = choose_shift_candidates(morning_pool, SHIFT_MORNING, morning_need, stats_map, shift_counts)
-        assign_shift_with_sync(SHIFT_MORNING, morning_selected, dt, schedule, shift_counts, stats_map, member_map, sync_groups, warnings)
+        assign_shift_with_sync(SHIFT_MORNING, morning_selected, dt, schedule, shift_counts, stats_map, member_map, assignment_sync_groups, warnings, count_member_names=staffing_names)
 
-        available = [n for n in member_names if schedule[n][dt] == SHIFT_UNASSIGNED]
-        current_afternoon_count = sum(schedule[n][dt] == SHIFT_AFTERNOON for n in member_names)
+        available = [n for n in staffing_names if schedule[n][dt] == SHIFT_UNASSIGNED]
+        current_afternoon_count = sum(schedule[n][dt] == SHIFT_AFTERNOON for n in staffing_names)
         afternoon_need = max(0, MIN_AFTERNOON - current_afternoon_count)
         afternoon_pool = [n for n in available if n not in follower_to_primary]
         if len(afternoon_pool) < afternoon_need:
             afternoon_pool = available
         afternoon_selected = choose_shift_candidates(afternoon_pool, SHIFT_AFTERNOON, afternoon_need, stats_map, shift_counts)
-        assign_shift_with_sync(SHIFT_AFTERNOON, afternoon_selected, dt, schedule, shift_counts, stats_map, member_map, sync_groups, warnings)
+        assign_shift_with_sync(SHIFT_AFTERNOON, afternoon_selected, dt, schedule, shift_counts, stats_map, member_map, assignment_sync_groups, warnings, count_member_names=staffing_names)
 
-        available = [n for n in member_names if schedule[n][dt] == SHIFT_UNASSIGNED]
+        available = [n for n in staffing_names if schedule[n][dt] == SHIFT_UNASSIGNED]
         # Assign remaining members, preferring continuity with yesterday's shift but defaulting extra staff to Afternoon.
         continuity_order = {SHIFT_NIGHT: 0, SHIFT_MORNING: 1, SHIFT_AFTERNOON: 2, None: 3, SHIFT_WEEKOFF: 4, SHIFT_LEAVE: 5}
         remaining_sorted = sorted(
@@ -3602,7 +4613,7 @@ def generate_rota(
             shift_options = [s for s in shift_options if s != SHIFT_NIGHT]
             for shift_option in shift_options:
                 if can_assign_shift(n, shift_option, dt, schedule, stats_map, member_map):
-                    assign_shift_with_sync(shift_option, [n], dt, schedule, shift_counts, stats_map, member_map, sync_groups, warnings)
+                    assign_shift_with_sync(shift_option, [n], dt, schedule, shift_counts, stats_map, member_map, assignment_sync_groups, warnings, count_member_names=staffing_names)
                     assigned = True
                     break
             if not assigned and schedule[n][dt] == SHIFT_UNASSIGNED:
@@ -3610,21 +4621,21 @@ def generate_rota(
                 month_wo_count[n] += 1
 
         # Final sweep: any truly unassigned person becomes WO.
-        for n in member_names:
+        for n in staffing_names:
             if schedule[n][dt] == SHIFT_UNASSIGNED:
                 schedule[n][dt] = SHIFT_WEEKOFF
                 month_wo_count[n] += 1
 
         day_counts = {
-            SHIFT_MORNING: sum(schedule[n][dt] == SHIFT_MORNING for n in member_names),
-            SHIFT_AFTERNOON: sum(schedule[n][dt] == SHIFT_AFTERNOON for n in member_names),
-            SHIFT_NIGHT: sum(schedule[n][dt] == SHIFT_NIGHT for n in member_names),
+            SHIFT_MORNING: sum(schedule[n][dt] == SHIFT_MORNING for n in staffing_names),
+            SHIFT_AFTERNOON: sum(schedule[n][dt] == SHIFT_AFTERNOON for n in staffing_names),
+            SHIFT_NIGHT: sum(schedule[n][dt] == SHIFT_NIGHT for n in staffing_names),
         }
         for shift_name, minimum in [(SHIFT_MORNING, MIN_MORNING), (SHIFT_AFTERNOON, MIN_AFTERNOON), (SHIFT_NIGHT, MIN_NIGHT)]:
             if day_counts[shift_name] < minimum:
                 warnings.append({"date": dt.isoformat(), "warning": f"{shift_name}: assigned {day_counts[shift_name]} < required {minimum}"})
 
-    for n in member_names:
+    for n in staffing_names:
         idx = 0
         while idx < len(dates):
             if schedule[n][dates[idx]] == SHIFT_NIGHT:
@@ -3638,11 +4649,67 @@ def generate_rota(
             else:
                 idx += 1
 
+    protected_weekoffs: Set[Tuple[str, date]] = set()
+    for _ in range(3):
+        repaired = False
+        if repair_post_night_rest_violations(
+            schedule,
+            staffing_names,
+            dates,
+            member_map,
+            locked_assignments,
+            protected_weekoffs,
+            warnings,
+        ):
+            repaired = True
+        if repair_excessive_work_streaks(
+            schedule,
+            staffing_names,
+            dates,
+            member_map,
+            locked_assignments,
+            protected_weekoffs,
+            warnings,
+        ):
+            repaired = True
+        if repair_daily_shift_shortages(
+            schedule,
+            staffing_names,
+            dates,
+            member_map,
+            bank_holidays,
+            locked_assignments,
+            protected_weekoffs,
+            warnings,
+        ):
+            repaired = True
+        if not repaired:
+            break
+
     target_weekoffs_per_member = sum(targets.values())
-    rebalance_weekoff_targets(schedule, member_names, dates, target_weekoffs_per_member, bank_holidays, member_map, locked_assignments)
+    rebalance_weekoff_targets(
+        schedule,
+        staffing_names,
+        dates,
+        target_weekoffs_per_member,
+        bank_holidays,
+        member_map,
+        locked_assignments,
+        additional_locked_weekoffs=protected_weekoffs,
+    )
+    repair_daily_shift_shortages(
+        schedule,
+        staffing_names,
+        dates,
+        member_map,
+        bank_holidays,
+        locked_assignments,
+        protected_weekoffs,
+        warnings,
+    )
     post_rebalance_weekoffs = {
         name: sum(1 for dt in dates if schedule[name][dt] == SHIFT_WEEKOFF)
-        for name in member_names
+        for name in staffing_names
     }
     unequal_weekoff_members = sorted(
         [name for name, count in post_rebalance_weekoffs.items() if count != target_weekoffs_per_member],
@@ -3662,6 +4729,32 @@ def generate_rota(
                     f"Affected members: {preview}{extra_suffix}."
                 ),
             }
+        )
+
+    apply_sync_followers_after_generation(
+        schedule,
+        dates,
+        sync_groups,
+        locked_assignments,
+    )
+
+    staffing_shortages: List[str] = []
+    for dt in dates:
+        counts = {
+            SHIFT_MORNING: sum(schedule[name][dt] == SHIFT_MORNING for name in member_names),
+            SHIFT_AFTERNOON: sum(schedule[name][dt] == SHIFT_AFTERNOON for name in member_names),
+            SHIFT_NIGHT: sum(schedule[name][dt] == SHIFT_NIGHT for name in member_names),
+        }
+        for shift_name, minimum in ((SHIFT_MORNING, MIN_MORNING), (SHIFT_AFTERNOON, MIN_AFTERNOON), (SHIFT_NIGHT, MIN_NIGHT)):
+            if counts[shift_name] < minimum:
+                staffing_shortages.append(f"{dt.isoformat()} {shift_name}={counts[shift_name]}<{minimum}")
+
+    if staffing_shortages:
+        preview = ", ".join(staffing_shortages[:8])
+        extra = "" if len(staffing_shortages) <= 8 else f", and {len(staffing_shortages) - 8} more"
+        raise ValueError(
+            f"Could not generate rota with compulsory minimum staffing ({MIN_MORNING} per Morning, {MIN_AFTERNOON} per Afternoon, {MIN_NIGHT} per Night). "
+            f"Shortages: {preview}{extra}"
         )
 
     matrix_rows, full_rows, daywise_rows, summary_rows = [], [], [], []
@@ -4978,7 +6071,8 @@ with st.sidebar:
 
             **Scheduling Rules**
             - One continuous Night block per member per month
-            - Maximum 5 continuous Night shifts
+            - Minimum 4 continuous Night shifts
+            - Maximum 6 continuous Night shifts
             - 2 compulsory WOs after a Night block
             - Maximum 6 continuous working days
 
@@ -5187,7 +6281,7 @@ if can_manage:
     st.caption(
         "Use this when you already know that a person must work a specific shift across a day or date range. "
         "Set only the start date for a single-day lock, or add an end date to cover a range. "
-        "If you preassign Night dates for a member in a month, the app treats them as one continuous Night block and keeps the compulsory WOs after that block."
+        f"If you preassign Night dates for a member in a month, the app treats them as one continuous {MIN_CONTINUOUS_NIGHT}-{MAX_CONTINUOUS_NIGHT} day Night block and keeps the compulsory WOs after that block."
     )
     st.caption("Choose the member and shift from the dropdowns, then use the calendar for the start and optional end date.")
     preassigned_df = render_preassigned_entries_editor(team_df, preassigned_default_df, start_date, end_date)
